@@ -1,0 +1,22 @@
+# Ignore everything and selectively allow files
+*
+
+!*.go
+!*.nix
+!*/
+!.envrc
+!.github/**/*
+!.gitignore
+!.golangci.yaml
+!.zed/*
+!CODE_OF_CONDUCT.md
+!LICENSE
+!README.md
+!flake.lock
+!flake.nix
+!go.mod
+!go.sum
+!govendor.toml
+
+# Recurse through sub-directories applying the same patterns
+!*/
