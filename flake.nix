@@ -38,12 +38,19 @@
 
         pre-commit-check = git-hooks.lib.${system}.run {
           src = ./.;
-          hooks.govendor = {
-            enable = true;
-            name = "govendor";
-            entry = "${go-overlay.packages.${system}.govendor}/bin/govendor --check";
-            files = "(^|/)go\\.(mod|work)$";
-            pass_filenames = true;
+          package = pkgs.prek;
+          hooks = {
+            alejandra = {
+              enable = true;
+              settings = {
+                check = true;
+              };
+            };
+
+            typos = {
+              enable = true;
+              entry = "${pkgs.typos}/bin/typos --force-exclude";
+            };
           };
         };
       in
@@ -52,8 +59,10 @@
             inherit (pre-commit-check) shellHook;
             buildInputs =
               [
-                (go.withTools ["gopls" "gofumpt" "staticcheck"])
-                go-overlay.packages.${system}.govendor
+                alejandra
+                (go.withTools ["golangci-lint" "gopls" "gofumpt" "staticcheck"])
+                nil
+                typos
               ]
               ++ pre-commit-check.enabledPackages;
           };

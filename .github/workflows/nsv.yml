@@ -1,0 +1,36 @@
+name: nsv
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  nsv:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          token: ${{ secrets.GH_NSV }}
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cachix-token: ${{ secrets.GH_CACHIX }}
+
+      - name: GPG Import
+        env:
+          GPG_PRIVATE_KEY: "${{ secrets.GPG_PRIVATE_KEY }}"
+          GPG_PASSPHRASE: "${{ secrets.GPG_PASSPHRASE }}"
+        run: nix run github:purpleclay/gpg-import/7378bf53364cbcb710e797d685f5ef50cf92473b # 0.9.0
+
+      - name: Tag
+        run: nix run github:purpleclay/nsv/b1ae852de4507769f2fccb998efb92ab0fcd70c0 -- tag --show # v0.12.2

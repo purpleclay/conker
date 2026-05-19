@@ -3,7 +3,6 @@
 
 !*.go
 !*.nix
-!*/
 !.envrc
 !.github/**/*
 !.gitignore
@@ -16,7 +15,6 @@
 !flake.nix
 !go.mod
 !go.sum
-!govendor.toml
 
 # Recurse through sub-directories applying the same patterns
 !*/
