@@ -1,0 +1,49 @@
+name: typos
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "LICENSE"
+      - ".github/stale.yml"
+      - ".github/renovate.json"
+      - ".github/CODEOWNERS"
+      - ".zed/**"
+      - "CODE_OF_CONDUCT.md"
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "LICENSE"
+      - ".github/stale.yml"
+      - ".github/renovate.json"
+      - ".github/CODEOWNERS"
+      - ".zed/**"
+      - "CODE_OF_CONDUCT.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typos:
+    runs-on: ubuntu-24.04
+    if: github.actor != 'renovate[bot]'
+    name: check spelling
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Nix
+        uses: ./.github/actions/setup-nix
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cachix-token: ${{ secrets.GH_CACHIX }}
+
+      - name: Run Typos
+        run: nix develop -c typos
