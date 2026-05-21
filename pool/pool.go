@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/purpleclay/conker/panics"
 )
@@ -50,10 +51,12 @@ type Pool struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
-	// cfgMu guards sem and started, preventing reconfiguration after the first
-	// Go call and ensuring each goroutine captures a stable semaphore reference.
-	cfgMu   sync.Mutex
-	started bool
+	// cfgMu guards sem, started, and taskTimeout, preventing reconfiguration
+	// after the first Go call and ensuring each goroutine captures a stable
+	// semaphore reference.
+	cfgMu       sync.Mutex
+	started     bool
+	taskTimeout time.Duration
 
 	mu   sync.Mutex
 	errs []error
@@ -85,6 +88,38 @@ func (p *Pool) WithMaxGoroutines(n int) *Pool {
 		panic("pool: WithMaxGoroutines must be called before Go")
 	}
 	p.sem = make(chan struct{}, n)
+	return p
+}
+
+// WithTaskTimeout sets a maximum duration for each individual task. The task's
+// context is cancelled after d, causing well-behaved tasks that observe
+// ctx.Done() to return [context.DeadlineExceeded]. Other concurrent tasks are
+// unaffected. It panics if d ≤ 0 or if called after the first [Pool.Go].
+//
+// Tasks must observe ctx.Done() to benefit from the timeout; a task that
+// ignores its context will run to completion regardless of the deadline.
+//
+// Example:
+//
+//	p := pool.New().WithTaskTimeout(5 * time.Second)
+//	p.Go(func(ctx context.Context) error {
+//	    select {
+//	    case result := <-slowExternalCall():
+//	        return process(result)
+//	    case <-ctx.Done():
+//	        return ctx.Err() // context.DeadlineExceeded after 5s
+//	    }
+//	})
+func (p *Pool) WithTaskTimeout(d time.Duration) *Pool {
+	if d <= 0 {
+		panic("pool: WithTaskTimeout requires d > 0")
+	}
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	if p.started {
+		panic("pool: WithTaskTimeout must be called before Go")
+	}
+	p.taskTimeout = d
 	return p
 }
 
@@ -138,7 +173,13 @@ func (p *Pool) runTask(fn func(context.Context) error) {
 	var err error
 
 	pc.Try(func() {
-		err = fn(p.ctx)
+		taskCtx := p.ctx
+		if p.taskTimeout > 0 {
+			var cancel context.CancelFunc
+			taskCtx, cancel = context.WithTimeout(taskCtx, p.taskTimeout)
+			defer cancel()
+		}
+		err = fn(taskCtx)
 	})
 
 	if r := pc.Recovered(); r != nil {
@@ -214,6 +255,13 @@ func NewWithResults[T any]() *ResultPool[T] {
 // concurrently. It panics if n ≤ 0 or if called after the first Go.
 func (p *ResultPool[T]) WithMaxGoroutines(n int) *ResultPool[T] {
 	p.pool.WithMaxGoroutines(n)
+	return p
+}
+
+// WithTaskTimeout sets a maximum duration for each individual task.
+// See [Pool.WithTaskTimeout] for full documentation.
+func (p *ResultPool[T]) WithTaskTimeout(d time.Duration) *ResultPool[T] {
+	p.pool.WithTaskTimeout(d)
 	return p
 }
 
