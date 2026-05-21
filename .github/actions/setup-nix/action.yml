@@ -25,7 +25,7 @@ runs:
       if: inputs.cachix-token != ''
       uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
       with:
-        name: go-overlay
+        name: purpleclay
         authToken: ${{ inputs.cachix-token }}
         skipPush: ${{ inputs.push-to-cachix != 'true' }}
         useDaemon: false
