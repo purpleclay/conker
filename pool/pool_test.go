@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,6 +77,55 @@ func TestPool_WithMaxGoroutines_PanicsAfterGo(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithMaxGoroutines(4) })
 	p.Wait() //nolint:errcheck
+}
+
+func TestPool_GoCtx_ReturnsNilOnSuccessfulSubmission(t *testing.T) {
+	p := pool.New()
+
+	var ran atomic.Bool
+	err := p.GoCtx(context.Background(), func(_ context.Context) error {
+		ran.Store(true)
+		return nil
+	})
+
+	require.NoError(t, p.Wait())
+	assert.NoError(t, err)
+	assert.True(t, ran.Load())
+}
+
+func TestPool_GoCtx_ReturnsCancelledWhenBlocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(1)
+
+		// Fill the only slot with a task that sleeps for 1s of fake time.
+		p.Go(func(_ context.Context) error {
+			time.Sleep(time.Second)
+			return nil
+		})
+
+		// Try to submit a second task with a context that times out at 100ms.
+		// The slot is held; GoCtx should unblock when the context expires.
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		var taskRan atomic.Bool
+		err := p.GoCtx(ctx, func(_ context.Context) error {
+			taskRan.Store(true)
+			return nil
+		})
+
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+		assert.False(t, taskRan.Load(), "task must not run when GoCtx returns an error")
+
+		require.NoError(t, p.Wait())
+	})
+}
+
+func TestPool_GoCtx_PanicsOnZeroValue(t *testing.T) {
+	var p pool.Pool
+	assert.Panics(t, func() {
+		_ = p.GoCtx(context.Background(), func(_ context.Context) error { return nil })
+	})
 }
 
 func TestPool_Go_PanicsOnZeroValue(t *testing.T) {
