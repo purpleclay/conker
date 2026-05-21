@@ -196,3 +196,97 @@ func TestPool_SQSBatchingRegression(t *testing.T) {
 	require.NoError(t, p.Wait())
 	assert.Equal(t, int64(len(messages)), processed.Load())
 }
+
+func TestResultPool_Go_CollectsResults(t *testing.T) {
+	p := pool.NewWithResults[int]()
+
+	for i := range 5 {
+		p.Go(func(_ context.Context) (int, error) { return i, nil })
+	}
+
+	results, err := p.Wait()
+	require.NoError(t, err)
+	assert.Len(t, results, 5)
+}
+
+// TestResultPool_Wait_PreservesSubmissionOrder verifies that results are
+// returned in submission order even when tasks complete in reverse order.
+func TestResultPool_Wait_PreservesSubmissionOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]()
+
+		// Submit in order but complete in reverse: task 3 finishes first.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(3 * time.Second); return 1, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 2, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 3, nil })
+
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{1, 2, 3}, results)
+	})
+}
+
+func TestResultPool_WithUnorderedResults_ReturnsCompletionOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithUnorderedResults()
+
+		// Same reverse-completion setup; without ordering, completion order is preserved.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(3 * time.Second); return 1, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 2, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 3, nil })
+
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{3, 2, 1}, results)
+	})
+}
+
+func TestResultPool_Wait_CollectsResultsEvenOnError(t *testing.T) {
+	p := pool.NewWithResults[int]()
+
+	sentinel := errors.New("task failed")
+	for i := range 5 {
+		p.Go(func(_ context.Context) (int, error) {
+			if i%2 == 0 {
+				return i, sentinel
+			}
+			return i, nil
+		})
+	}
+
+	results, err := p.Wait()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, sentinel)
+	assert.Len(t, results, 5, "all results must be present regardless of task errors")
+}
+
+func TestResultPool_Wait_CollectsResultEvenOnPanic(t *testing.T) {
+	p := pool.NewWithResults[int]()
+	p.Go(func(_ context.Context) (int, error) { panic("task panicked") })
+
+	results, err := p.Wait()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, panics.ErrPanic)
+	assert.Len(t, results, 1, "result entry must be recorded even when the task panics")
+}
+
+func TestResultPool_GoCtx_ReturnsCancelledWhenBlocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(1)
+
+		p.Go(func(_ context.Context) (int, error) {
+			time.Sleep(time.Second)
+			return 0, nil
+		})
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		err := p.GoCtx(ctx, func(_ context.Context) (int, error) { return 1, nil })
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.Len(t, results, 1, "only the first task should have a result")
+	})
+}

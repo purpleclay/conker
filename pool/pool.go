@@ -1,10 +1,13 @@
 package pool
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"runtime"
+	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/purpleclay/conker/panics"
 )
@@ -160,4 +163,119 @@ func (p *Pool) Wait() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return errors.Join(p.errs...)
+}
+
+// indexedResult pairs a task result with its submission index, enabling
+// submission-order sorting in ResultPool.Wait.
+type indexedResult[T any] struct {
+	idx int64
+	val T
+	err error
+}
+
+// ResultPool is a bounded, panic-safe task runner that collects typed results.
+// Create one with [NewWithResults]; the zero value is not usable.
+//
+// Results are returned in submission order by default. Use
+// [ResultPool.WithUnorderedResults] to skip the sort when order does not
+// matter and result counts are large enough for the overhead to be noticeable.
+//
+// Results from errored tasks are always included in the output slice. The
+// caller receives both the full result set and the joined errors from
+// [ResultPool.Wait], and can filter as needed.
+//
+// Example — concurrent map with ordered results:
+//
+//	p := pool.NewWithResults[string]()
+//	for _, id := range ids {
+//	    p.Go(func(ctx context.Context) (string, error) {
+//	        return fetch(ctx, id)
+//	    })
+//	}
+//	results, err := p.Wait()
+type ResultPool[T any] struct {
+	pool    *Pool
+	idx     atomic.Int64
+	mu      sync.Mutex
+	results []indexedResult[T]
+	ordered bool
+}
+
+// NewWithResults returns a ResultPool with submission-order results and a
+// default concurrency limit of [runtime.GOMAXPROCS](0).
+func NewWithResults[T any]() *ResultPool[T] {
+	return &ResultPool[T]{
+		pool:    New(),
+		ordered: true,
+	}
+}
+
+// WithMaxGoroutines sets the maximum number of goroutines that may run
+// concurrently. It panics if n ≤ 0 or if called after the first Go.
+func (p *ResultPool[T]) WithMaxGoroutines(n int) *ResultPool[T] {
+	p.pool.WithMaxGoroutines(n)
+	return p
+}
+
+// WithUnorderedResults switches the pool to completion-order results,
+// skipping the submission-order sort in [ResultPool.Wait]. Use this when
+// result order does not matter and the result count is large enough for the
+// sort overhead to be noticeable.
+func (p *ResultPool[T]) WithUnorderedResults() *ResultPool[T] {
+	p.ordered = false
+	return p
+}
+
+// GoCtx submits fn as a task, returning [context.Err] if ctx is cancelled
+// while waiting for a goroutine slot. The result is always recorded, even
+// when fn returns an error.
+func (p *ResultPool[T]) GoCtx(ctx context.Context, fn func(context.Context) (T, error)) error {
+	idx := p.idx.Add(1) - 1
+	return p.pool.GoCtx(ctx, func(taskCtx context.Context) error {
+		var (
+			val T
+			err error
+			pc  panics.Catcher
+		)
+		pc.Try(func() {
+			val, err = fn(taskCtx)
+		})
+		if r := pc.Recovered(); r != nil {
+			err = r
+		}
+		p.mu.Lock()
+		p.results = append(p.results, indexedResult[T]{idx: idx, val: val, err: err})
+		p.mu.Unlock()
+		return err
+	})
+}
+
+// Go submits fn as a task. It blocks until a goroutine slot is available.
+func (p *ResultPool[T]) Go(fn func(context.Context) (T, error)) {
+	_ = p.GoCtx(p.pool.ctx, fn)
+}
+
+// Wait blocks until all tasks have completed and returns the collected results
+// alongside [errors.Join] of all task errors. Results from errored tasks are
+// included — no result is silently dropped.
+//
+// By default results are sorted into submission order before returning.
+// With [ResultPool.WithUnorderedResults] they are returned in completion order.
+func (p *ResultPool[T]) Wait() ([]T, error) {
+	err := p.pool.Wait()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.ordered {
+		slices.SortFunc(p.results, func(a, b indexedResult[T]) int {
+			return cmp.Compare(a.idx, b.idx)
+		})
+	}
+
+	out := make([]T, len(p.results))
+	for i, r := range p.results {
+		out[i] = r.val
+	}
+	return out, err
 }

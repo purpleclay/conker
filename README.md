@@ -131,12 +131,12 @@ if r := wg.WaitAndRecover(); r != nil {
 
 `conker` is pre-1.0. The following milestones track progress toward a stable API:
 
-| Milestone  | Theme              | Status      |
-| ---------- | ------------------ | ----------- |
-| **v0.1.0** | Foundations        | ✅           |
-| **v0.2.0** | Pool               | Planned     |
-| **v0.3.0** | Stream             | Planned     |
-| **v0.4.0** | Iter               | Planned     |
-| **v0.5.0** | Daemons & tooling  | Planned     |
+| Milestone  | Theme             | Status      |
+| ---------- | ----------------- | ----------- |
+| **v0.1.0** | Foundations       | ✅          |
+| **v0.2.0** | Pool              | In Progress |
+| **v0.3.0** | Stream            | Planned     |
+| **v0.4.0** | Iter              | Planned     |
+| **v0.5.0** | Daemons & tooling | Planned     |
 
 Upcoming highlights: `pool.Pool` with recursive task submission and bounded backpressure, `pool.ResultPool[T]` with submission-order results by default, `stream.Stream` with ordered concurrent callbacks, and native Go 1.23 `iter.Seq`/`iter.Seq2` support in the `iter` package.
