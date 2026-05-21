@@ -85,29 +85,49 @@ func (p *Pool) WithMaxGoroutines(n int) *Pool {
 	return p
 }
 
+// GoCtx submits fn as a task, returning [context.Err] if ctx is cancelled
+// while waiting for a goroutine slot. It returns nil on successful submission.
+//
+// This is the primary submission primitive for producers that need cooperative
+// shutdown: when the producer's context is cancelled (e.g. due to a signal or
+// parent timeout), GoCtx unblocks immediately rather than waiting indefinitely
+// for a free slot.
+//
+// GoCtx panics if called on a zero-value Pool; use [New] or call
+// [Pool.WithMaxGoroutines] before submitting tasks.
+func (p *Pool) GoCtx(ctx context.Context, fn func(context.Context) error) error {
+	p.cfgMu.Lock()
+	sem := p.sem
+	if sem == nil {
+		p.cfgMu.Unlock()
+		panic("pool: use New() or call WithMaxGoroutines before GoCtx")
+	}
+	p.started = true
+	p.cfgMu.Unlock()
+
+	select {
+	case sem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	p.wg.Go(func() {
+		defer func() { <-sem }()
+		p.runTask(fn)
+	})
+	return nil
+}
+
 // Go submits fn as a task. It blocks until a goroutine slot is available.
 // The task receives the pool's context.
 //
-// Go is safe to call from within a running task. Wait will wait for all
+// Go is safe to call from within a running task. [Wait] will wait for all
 // submitted tasks, including those submitted recursively.
 //
 // Go panics if called on a zero-value Pool; use [New] or call
 // [Pool.WithMaxGoroutines] before submitting tasks.
 func (p *Pool) Go(fn func(context.Context) error) {
-	p.cfgMu.Lock()
-	sem := p.sem
-	if sem == nil {
-		p.cfgMu.Unlock()
-		panic("pool: use New() or call WithMaxGoroutines before Go")
-	}
-	p.started = true
-	p.cfgMu.Unlock()
-
-	sem <- struct{}{}
-	p.wg.Go(func() {
-		defer func() { <-sem }()
-		p.runTask(fn)
-	})
+	_ = p.GoCtx(p.ctx, fn)
 }
 
 func (p *Pool) runTask(fn func(context.Context) error) {
