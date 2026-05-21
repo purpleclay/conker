@@ -197,6 +197,52 @@ func TestPool_SQSBatchingRegression(t *testing.T) {
 	assert.Equal(t, int64(len(messages)), processed.Load())
 }
 
+func TestPool_WithTaskTimeout_CancelsTaskContextAfterDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithTaskTimeout(100 * time.Millisecond)
+
+		var taskErr error
+		p.Go(func(ctx context.Context) error {
+			// Simulate work that outlasts the deadline.
+			select {
+			case <-time.After(time.Second):
+				return nil
+			case <-ctx.Done():
+				taskErr = ctx.Err()
+				return taskErr
+			}
+		})
+
+		require.Error(t, p.Wait())
+		assert.ErrorIs(t, taskErr, context.DeadlineExceeded)
+	})
+}
+
+func TestPool_WithTaskTimeout_OtherTasksUnaffected(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithTaskTimeout(time.Second)
+
+		// This task completes well before the timeout — it must not be cancelled.
+		var taskErr error
+		p.Go(func(ctx context.Context) error {
+			time.Sleep(100 * time.Millisecond)
+			taskErr = ctx.Err()
+			return nil
+		})
+
+		require.NoError(t, p.Wait())
+		assert.NoError(t, taskErr, "task that completes before deadline must not see a cancelled context")
+	})
+}
+
+func TestPool_WithTaskTimeout_PanicsAfterGo(t *testing.T) {
+	p := pool.New()
+	p.Go(func(_ context.Context) error { return nil })
+
+	assert.Panics(t, func() { p.WithTaskTimeout(time.Second) })
+	p.Wait() //nolint:errcheck
+}
+
 func TestResultPool_Go_CollectsResults(t *testing.T) {
 	p := pool.NewWithResults[int]()
 
