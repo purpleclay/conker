@@ -250,6 +250,103 @@ func TestPool_SQSBatchingRegression(t *testing.T) {
 	assert.Equal(t, int64(len(messages)), processed.Load())
 }
 
+func TestPool_Reset_AllowsReuse(t *testing.T) {
+	p := pool.New()
+
+	var count atomic.Int64
+	inc := func(_ context.Context) error { count.Add(1); return nil }
+
+	p.Go(inc)
+	require.NoError(t, p.Wait())
+	assert.Equal(t, int64(1), count.Load())
+
+	p.Reset()
+
+	p.Go(inc)
+	require.NoError(t, p.Wait())
+	assert.Equal(t, int64(2), count.Load())
+}
+
+func TestPool_Reset_ClearsErrors(t *testing.T) {
+	p := pool.New()
+
+	p.Go(func(_ context.Context) error { return errors.New("oops") })
+	require.Error(t, p.Wait())
+
+	p.Reset()
+
+	require.NoError(t, p.Wait())
+	assert.Empty(t, p.Errors())
+}
+
+func TestPool_Reset_PreservesConfiguration(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var concurrent atomic.Int64
+		var peak atomic.Int64
+
+		p := pool.New().WithMaxGoroutines(2)
+
+		run := func(_ context.Context) error {
+			n := concurrent.Add(1)
+			for {
+				if cur := peak.Load(); n <= cur || peak.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			concurrent.Add(-1)
+			return nil
+		}
+
+		for range 4 {
+			p.Go(run)
+		}
+		require.NoError(t, p.Wait())
+		assert.LessOrEqual(t, peak.Load(), int64(2), "must not exceed 2 concurrent goroutines before reset")
+
+		peak.Store(0)
+		concurrent.Store(0)
+		p.Reset()
+
+		for range 4 {
+			p.Go(run)
+		}
+		require.NoError(t, p.Wait())
+		assert.LessOrEqual(t, peak.Load(), int64(2), "must not exceed 2 concurrent goroutines after reset")
+	})
+}
+
+func TestPool_Reset_PreservesTaskTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithTaskTimeout(100 * time.Millisecond)
+
+		p.Go(func(ctx context.Context) error {
+			select {
+			case <-time.After(time.Second):
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+		require.Error(t, p.Wait())
+
+		p.Reset()
+
+		var taskErr error
+		p.Go(func(ctx context.Context) error {
+			select {
+			case <-time.After(time.Second):
+				return nil
+			case <-ctx.Done():
+				taskErr = ctx.Err()
+				return taskErr
+			}
+		})
+		require.Error(t, p.Wait())
+		assert.ErrorIs(t, taskErr, context.DeadlineExceeded, "task timeout must still apply after reset")
+	})
+}
+
 func TestPool_WithTaskTimeout_CancelsTaskContextAfterDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := pool.New().WithTaskTimeout(100 * time.Millisecond)
@@ -433,5 +530,78 @@ func TestResultPool_Errors_WithUnorderedResults_ReturnsCompletionOrder(t *testin
 		require.Len(t, errs, 2)
 		assert.Same(t, errB, errs[0], "first completed error must come first")
 		assert.Same(t, errA, errs[1], "second completed error must come second")
+	})
+}
+
+func TestResultPool_Reset_AllowsReuse(t *testing.T) {
+	p := pool.NewWithResults[int]()
+
+	p.Go(func(_ context.Context) (int, error) { return 1, nil })
+	results, err := p.Wait()
+	require.NoError(t, err)
+	assert.Equal(t, []int{1}, results)
+
+	p.Reset()
+
+	p.Go(func(_ context.Context) (int, error) { return 2, nil })
+	results, err = p.Wait()
+	require.NoError(t, err)
+	assert.Equal(t, []int{2}, results)
+}
+
+func TestResultPool_Reset_ClearsResults(t *testing.T) {
+	p := pool.NewWithResults[int]()
+
+	p.Go(func(_ context.Context) (int, error) { return 42, nil })
+	p.Wait() //nolint:errcheck
+
+	p.Reset()
+
+	results, err := p.Wait()
+	require.NoError(t, err)
+	assert.Empty(t, results)
+}
+
+func TestResultPool_Reset_PreservesSubmissionOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]()
+
+		// First cycle — complete in reverse order.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, nil })
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{1, 2}, results)
+
+		p.Reset()
+
+		// Second cycle — submission index must restart from zero.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 3, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 4, nil })
+		results, err = p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{3, 4}, results)
+	})
+}
+
+func TestResultPool_Reset_PreservesUnorderedResults(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithUnorderedResults()
+
+		// First cycle — complete in reverse order; expect completion order.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, nil })
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{2, 1}, results)
+
+		p.Reset()
+
+		// Second cycle — WithUnorderedResults must still be in effect.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 3, nil })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 4, nil })
+		results, err = p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{4, 3}, results, "completion order must be preserved after reset")
 	})
 }
