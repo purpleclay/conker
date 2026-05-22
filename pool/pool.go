@@ -206,6 +206,27 @@ func (p *Pool) Wait() error {
 	return errors.Join(p.errs...)
 }
 
+// Errors returns a slice of all errors collected from tasks. This provides
+// access to the raw error slice for callers needing per-error filtering with
+// [errors.As]. Returns nil if no errors occurred.
+//
+// Example — filtering errors by type:
+//
+//	p := pool.New()
+//	// ... submit tasks
+//	p.Wait()
+//	for _, err := range p.Errors() {
+//	    var taskErr *MyTaskError
+//	    if errors.As(err, &taskErr) {
+//	        log.Printf("task %s failed: %v", taskErr.ID, taskErr)
+//	    }
+//	}
+func (p *Pool) Errors() []error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.errs)
+}
+
 // indexedResult pairs a task result with its submission index, enabling
 // submission-order sorting in ResultPool.Wait.
 type indexedResult[T any] struct {
@@ -326,4 +347,31 @@ func (p *ResultPool[T]) Wait() ([]T, error) {
 		out[i] = r.val
 	}
 	return out, err
+}
+
+// Errors returns a slice of non-nil errors collected from tasks in submission
+// order by default, consistent with the result ordering from [ResultPool.Wait].
+// With [ResultPool.WithUnorderedResults] errors are returned in completion order.
+// Returns nil if no errors occurred.
+//
+// See [Pool.Errors] for filtering errors by type with [errors.As].
+func (p *ResultPool[T]) Errors() []error {
+	p.mu.Lock()
+	results := slices.Clone(p.results)
+	ordered := p.ordered
+	p.mu.Unlock()
+
+	if ordered {
+		slices.SortFunc(results, func(a, b indexedResult[T]) int {
+			return cmp.Compare(a.idx, b.idx)
+		})
+	}
+
+	var errs []error
+	for _, r := range results {
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
+	}
+	return errs
 }
