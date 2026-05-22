@@ -393,6 +393,31 @@ func TestPool_WithTaskTimeout_PanicsAfterGo(t *testing.T) {
 	p.Wait() //nolint:errcheck
 }
 
+func TestResultPool_WithCapacity_PanicsOnInvalidN(t *testing.T) {
+	assert.Panics(t, func() { pool.NewWithResults[int]().WithCapacity(0) })
+	assert.Panics(t, func() { pool.NewWithResults[int]().WithCapacity(-1) })
+}
+
+func TestResultPool_WithCapacity_PanicsAfterGo(t *testing.T) {
+	p := pool.NewWithResults[int]()
+	p.Go(func(_ context.Context) (int, error) { return 1, nil })
+
+	assert.Panics(t, func() { p.WithCapacity(10) })
+	p.Wait() //nolint:errcheck
+}
+
+func TestResultPool_WithCapacity_CollectsCorrectResults(t *testing.T) {
+	p := pool.NewWithResults[int]().WithCapacity(5)
+
+	for i := range 5 {
+		p.Go(func(_ context.Context) (int, error) { return i, nil })
+	}
+
+	results, err := p.Wait()
+	require.NoError(t, err)
+	assert.Equal(t, []int{0, 1, 2, 3, 4}, results)
+}
+
 func TestResultPool_Go_CollectsResults(t *testing.T) {
 	p := pool.NewWithResults[int]()
 
