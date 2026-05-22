@@ -60,7 +60,13 @@
             buildInputs =
               [
                 alejandra
-                (go.withTools ["golangci-lint" "gopls" "gofumpt" "staticcheck"])
+                (go.withTools [
+                  "golangci-lint"
+                  "gopls"
+                  "gofumpt"
+                  "staticcheck"
+                ])
+                goperf
                 nil
                 typos
               ]

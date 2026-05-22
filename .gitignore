@@ -15,6 +15,7 @@
 !flake.nix
 !go.mod
 !go.sum
+!**/testdata/*.txt
 
 # Recurse through sub-directories applying the same patterns
 !*/

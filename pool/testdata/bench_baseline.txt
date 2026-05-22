@@ -1,0 +1,53 @@
+# Baseline generated: 2026-05-22
+# Command: go test ./pool -bench 'Benchmark(Pool_Go|ResultPool_Go_.*)$' -benchmem -benchtime=5s -count=5
+# Go: go1.25.0
+# GOOS/GOARCH: darwin/arm64
+# CPU: Apple M4 Pro
+# GOMAXPROCS: 12
+# Note: regenerate this baseline on CI hardware once the bench workflow is wired up.
+BenchmarkPool_Go/workers=1-12          	  148537	     40179 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=1-12          	  147597	     40226 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=1-12          	  149305	     40031 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=1-12          	  149302	     40367 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=1-12          	  149036	     40346 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=12-12         	  106996	     56173 ns/op	    6610 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=12-12         	  106960	     55664 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=12-12         	  106108	     56994 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=12-12         	  108217	     55502 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=12-12         	   98047	     61355 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=24-12         	  102232	     58460 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=24-12         	  103210	     58534 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=24-12         	  102736	     58288 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=24-12         	  101395	     59418 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkPool_Go/workers=24-12         	  105102	     57018 ns/op	    6608 B/op	     303 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=1-12         	  123502	     48603 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=1-12         	  124394	     48373 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=1-12         	  123832	     48056 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=1-12         	  123462	     48372 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=1-12         	  123740	     48352 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=12-12        	   85418	     71036 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=12-12        	   95150	     61758 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=12-12        	   98958	     60677 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=12-12        	   99156	     59174 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=12-12        	   90882	     66208 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=24-12        	   83736	     71259 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=24-12        	   94938	     63164 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=24-12        	   93961	     64112 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=24-12        	   95486	     63111 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Ordered/workers=24-12        	   82527	     72883 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=1-12       	  135127	     44077 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=1-12       	  135799	     44175 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=1-12       	  136806	     44058 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=1-12       	  135279	     44175 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=1-12       	  135116	     44204 ns/op	   19736 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=12-12      	  101862	     59060 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=12-12      	  105094	     57080 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=12-12      	   93494	     65230 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=12-12      	  104583	     57082 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=12-12      	   93171	     64198 ns/op	   19740 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=24-12      	   87310	     68009 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=24-12      	   97009	     62244 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=24-12      	   97058	     61847 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=24-12      	   94188	     64466 ns/op	   19741 B/op	     511 allocs/op
+BenchmarkResultPool_Go_Unordered/workers=24-12      	   89978	     66092 ns/op	   19742 B/op	     511 allocs/op
+PASS
