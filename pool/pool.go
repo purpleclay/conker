@@ -206,6 +206,19 @@ func (p *Pool) Wait() error {
 	return errors.Join(p.errs...)
 }
 
+// Reset clears all collected errors and reinitialises the internal context,
+// allowing the pool to be reused for another batch of work. Configuration set
+// via [Pool.WithMaxGoroutines] and [Pool.WithTaskTimeout] is preserved.
+//
+// Reset must not be called concurrently with [Pool.Go] or while tasks are
+// running; call it only after [Pool.Wait] has returned.
+func (p *Pool) Reset() {
+	p.mu.Lock()
+	p.errs = nil
+	p.mu.Unlock()
+	p.ctx, p.cancel = context.WithCancelCause(context.Background())
+}
+
 // Errors returns a slice of all errors collected from tasks. This provides
 // access to the raw error slice for callers needing per-error filtering with
 // [errors.As]. Returns nil if no errors occurred.
@@ -347,6 +360,22 @@ func (p *ResultPool[T]) Wait() ([]T, error) {
 		out[i] = r.val
 	}
 	return out, err
+}
+
+// Reset clears all collected results and errors, reinitialises the submission
+// index, and delegates to [Pool.Reset] to reinitialise the internal context.
+// Configuration set via [ResultPool.WithMaxGoroutines],
+// [ResultPool.WithTaskTimeout], and [ResultPool.WithUnorderedResults] is
+// preserved.
+//
+// Reset must not be called concurrently with [ResultPool.Go] or while tasks
+// are running; call it only after [ResultPool.Wait] has returned.
+func (p *ResultPool[T]) Reset() {
+	p.mu.Lock()
+	p.results = nil
+	p.mu.Unlock()
+	p.idx.Store(0)
+	p.pool.Reset()
 }
 
 // Errors returns a slice of non-nil errors collected from tasks in submission
