@@ -85,3 +85,39 @@ func BenchmarkResultPool_Go_Unordered(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkResultPool_Go_NoCapacity and BenchmarkResultPool_Go_WithCapacity
+// measure the cold-start allocation cost of single-use pools (no Reset), so
+// the two can be compared directly with benchstat to quantify the saving from
+// pre-allocating the results slice.
+func BenchmarkResultPool_Go_NoCapacity(b *testing.B) {
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				p := pool.NewWithResults[struct{}]().WithMaxGoroutines(workers)
+				for range benchTasks {
+					p.Go(noopResult)
+				}
+				_, err := p.Wait()
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
+func BenchmarkResultPool_Go_WithCapacity(b *testing.B) {
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				p := pool.NewWithResults[struct{}]().WithMaxGoroutines(workers).WithCapacity(benchTasks)
+				for range benchTasks {
+					p.Go(noopResult)
+				}
+				_, err := p.Wait()
+				require.NoError(b, err)
+			}
+		})
+	}
+}

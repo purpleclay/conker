@@ -274,6 +274,7 @@ type ResultPool[T any] struct {
 	mu      sync.Mutex
 	results []indexedResult[T]
 	ordered bool
+	capHint int
 }
 
 // NewWithResults returns a ResultPool with submission-order results and a
@@ -296,6 +297,24 @@ func (p *ResultPool[T]) WithMaxGoroutines(n int) *ResultPool[T] {
 // See [Pool.WithTaskTimeout] for full documentation.
 func (p *ResultPool[T]) WithTaskTimeout(d time.Duration) *ResultPool[T] {
 	p.pool.WithTaskTimeout(d)
+	return p
+}
+
+// WithCapacity pre-allocates the internal results slice to n, eliminating
+// repeated slice growth allocations when the number of tasks is known
+// upfront. The capacity is retained across [ResultPool.Reset] calls.
+// It panics if n ≤ 0 or if called after the first [ResultPool.Go].
+func (p *ResultPool[T]) WithCapacity(n int) *ResultPool[T] {
+	if n <= 0 {
+		panic("pool: WithCapacity requires n > 0")
+	}
+	p.pool.cfgMu.Lock()
+	defer p.pool.cfgMu.Unlock()
+	if p.pool.started {
+		panic("pool: WithCapacity must be called before Go")
+	}
+	p.results = make([]indexedResult[T], 0, n)
+	p.capHint = n
 	return p
 }
 
@@ -365,14 +384,22 @@ func (p *ResultPool[T]) Wait() ([]T, error) {
 // Reset clears all collected results and errors, reinitialises the submission
 // index, and delegates to [Pool.Reset] to reinitialise the internal context.
 // Configuration set via [ResultPool.WithMaxGoroutines],
-// [ResultPool.WithTaskTimeout], and [ResultPool.WithUnorderedResults] is
-// preserved.
+// [ResultPool.WithTaskTimeout], [ResultPool.WithUnorderedResults], and
+// [ResultPool.WithCapacity] is preserved.
 //
 // Reset must not be called concurrently with [ResultPool.Go] or while tasks
 // are running; call it only after [ResultPool.Wait] has returned.
 func (p *ResultPool[T]) Reset() {
 	p.mu.Lock()
-	p.results = nil
+	if p.capHint > 0 {
+		if cap(p.results) < p.capHint {
+			p.results = make([]indexedResult[T], 0, p.capHint)
+		} else {
+			p.results = p.results[:0]
+		}
+	} else {
+		p.results = nil
+	}
 	p.mu.Unlock()
 	p.idx.Store(0)
 	p.pool.Reset()
