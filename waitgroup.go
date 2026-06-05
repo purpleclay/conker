@@ -41,7 +41,7 @@ func (w *WaitGroup) Go(f func()) {
 }
 
 // Wait blocks until all goroutines launched with [WaitGroup.Go] have returned,
-// then re-panics with the first captured panic as a [*panics.Recovered]. It is
+// then re-panics with the first captured panic as a *[panics.Recovered]. It is
 // a no-op if no goroutine panicked.
 func (w *WaitGroup) Wait() {
 	w.wg.Wait()
