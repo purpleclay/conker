@@ -129,6 +129,99 @@ if r := wg.WaitAndRecover(); r != nil {
 }
 ```
 
+## Bounded concurrent tasks, not cancel-on-first-error
+
+Running bounded concurrent tasks in Go typically means `errgroup` — and when used with `errgroup.WithContext`, it cancels remaining work on first error and still returns only one error from `Wait`.
+
+`pool.Pool` collects every error from every task via `errors.Join`, recovers panics as typed `*panics.Recovered` errors, and passes each task its own context for per-task timeouts and backpressure via `GoCtx`.
+
+<table>
+<tr>
+<th><code>errgroup</code></th>
+<th><code>conker</code></th>
+</tr>
+<tr>
+<td>
+
+```go
+g, ctx := errgroup.WithContext(context.Background())
+g.SetLimit(10)
+for _, item := range items {
+    g.Go(func() error {
+        return process(ctx, item)
+    })
+}
+// cancels remaining tasks on first error;
+// Wait returns only that one error;
+// panics crash the process
+if err := g.Wait(); err != nil { ... }
+```
+
+</td>
+<td>
+
+```go
+p := pool.New().WithMaxGoroutines(10)
+for _, item := range items {
+    p.Go(func(ctx context.Context) error {
+        return process(ctx, item)
+    })
+}
+// collects all errors via errors.Join;
+// panics surface as *panics.Recovered
+if err := p.Wait(); err != nil { ... }
+```
+
+</td>
+</tr>
+</table>
+
+## All results collected, not silently dropped
+
+`sourcegraph/conc`'s error-variant pools (`ResultErrorPool`, `ResultContextPool`) drop results from failed tasks by default. The `WithCollectErrored()` option exists specifically to opt back in — meaning silent data loss is the default behaviour.
+
+`pool.ResultPool[T]` always returns every result alongside every error. Nothing is silently discarded because a task failed or panicked.
+
+<table>
+<tr>
+<th><code>sourcegraph/conc</code></th>
+<th><code>conker</code></th>
+</tr>
+<tr>
+<td>
+
+```go
+p := pool.NewWithResults[string]().WithErrors()
+for _, id := range ids {
+    id := id
+    p.Go(func() (string, error) {
+        return fetch(id)
+    })
+}
+results, err := p.Wait()
+// results from failed tasks are silently
+// dropped unless WithCollectErrored() is set
+```
+
+</td>
+<td>
+
+```go
+p := pool.NewWithResults[string]()
+for _, id := range ids {
+    p.Go(func(_ context.Context) (string, error) {
+        return fetch(id)
+    })
+}
+results, err := p.Wait()
+// all results returned alongside errors;
+// nothing is silently dropped
+```
+
+</td>
+</tr>
+</table>
+
 # Roadmap
 
 `conker` is pre-1.0. The following milestones track progress toward a stable API:
