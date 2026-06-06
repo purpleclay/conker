@@ -10,10 +10,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
 	"github.com/purpleclay/conker/panics"
 	"github.com/purpleclay/conker/stream"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func TestStream_Go_ExecutesCallback(t *testing.T) {
 	s := stream.New()
