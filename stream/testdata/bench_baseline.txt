@@ -1,0 +1,22 @@
+# Baseline generated: 2026-06-06
+# Command: go test ./stream -bench=. -benchmem -benchtime=5s -count=5
+# Go: go1.25.0
+# GOOS/GOARCH: darwin/arm64
+# CPU: Apple M4 Pro
+# GOMAXPROCS: 12
+# Note: regenerate this baseline on CI hardware once the bench workflow is wired up.
+BenchmarkStream_Go/workers=1-12         	   86091	     69697 ns/op	   17578 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=1-12         	   86182	     69477 ns/op	   17576 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=1-12         	   86990	     68836 ns/op	   17576 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=1-12         	   87728	     69469 ns/op	   17576 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=1-12         	   85489	     71019 ns/op	   17576 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=12-12        	  118744	     50757 ns/op	   17665 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=12-12        	  118141	     50780 ns/op	   17665 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=12-12        	  117495	     50728 ns/op	   17664 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=12-12        	  118466	     49846 ns/op	   17664 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=12-12        	  124028	     48550 ns/op	   17664 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=24-12        	  110667	     52281 ns/op	   17761 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=24-12        	  117806	     50853 ns/op	   17760 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=24-12        	  116721	     51006 ns/op	   17760 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=24-12        	  119017	     50672 ns/op	   17760 B/op	     410 allocs/op
+BenchmarkStream_Go/workers=24-12        	  117033	     50790 ns/op	   17760 B/op	     410 allocs/op

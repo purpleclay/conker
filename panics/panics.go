@@ -10,7 +10,7 @@ import (
 // ErrPanic is the sentinel matched by [errors.Is] for any recovered panic.
 //
 // Callers that only need to detect "was this a panic?" can check against
-// ErrPanic without importing or naming the [*Recovered] type directly:
+// ErrPanic without importing or naming the *[Recovered] type directly:
 //
 //	if errors.Is(err, panics.ErrPanic) {
 //	    log.Println("a goroutine panicked:", err)

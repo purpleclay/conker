@@ -14,6 +14,7 @@ go get github.com/purpleclay/conker
 
 - Use [`pool.Pool`](https://pkg.go.dev/github.com/purpleclay/conker/pool#Pool) if you want bounded, panic-safe concurrent task execution with recursive submission and error aggregation.
 - Use [`pool.ResultPool[T]`](https://pkg.go.dev/github.com/purpleclay/conker/pool#ResultPool) if tasks produce typed results and you want them back in submission order.
+- Use [`stream.Stream`](https://pkg.go.dev/github.com/purpleclay/conker/stream#Stream) if you want concurrent producers with callbacks that execute strictly in submission order, each blocking until its slot's turn arrives.
 - Use [`conker.WaitGroup`](https://pkg.go.dev/github.com/purpleclay/conker#WaitGroup) if you want a panic-safe replacement for `sync.WaitGroup`.
 - Use [`panics.Catcher`](https://pkg.go.dev/github.com/purpleclay/conker/panics#Catcher) if you want to catch panics in goroutines you manage yourself.
 - Use [`panics.ErrPanic`](https://pkg.go.dev/github.com/purpleclay/conker/panics#ErrPanic) with `errors.Is` to detect recovered panics without a type assertion.
@@ -176,6 +177,57 @@ if err := p.Wait(); err != nil { ... }
 </tr>
 </table>
 
+## Concurrent processing with ordered callbacks
+
+Processing items concurrently but emitting results in the original order typically requires buffering everything, sorting by index, and iterating only after all work is done.
+
+`stream.Stream` separates the two concerns: producers run concurrently, but the dispatcher advances strictly in submission order — blocking on each slot until its producer finishes before calling the callback and moving to the next. A fast producer whose slot comes after a slow one waits; nothing fires out of sequence.
+
+<table>
+<tr>
+<th><code>stdlib</code></th>
+<th><code>conker</code></th>
+</tr>
+<tr>
+<td>
+
+```go
+results := make([]string, len(items))
+var wg sync.WaitGroup
+for i, item := range items {
+    wg.Add(1)
+    go func(i int, item Item) {
+        defer wg.Done()
+        results[i] = process(item)
+    }(i, item)
+}
+wg.Wait()
+// ordered, but only after all work is done
+for _, r := range results {
+    emit(r)
+}
+```
+
+</td>
+<td>
+
+```go
+s := stream.New()
+for _, item := range items {
+    s.Go(func(ctx context.Context) stream.Callback {
+        result := process(ctx, item) // concurrent
+        return func() {
+            emit(result) // ordered, fires when this slot's turn arrives
+        }
+    })
+}
+s.Wait()
+```
+
+</td>
+</tr>
+</table>
+
 ## All results collected, not silently dropped
 
 `sourcegraph/conc`'s error-variant pools (`ResultErrorPool`, `ResultContextPool`) drop results from failed tasks by default. The `WithCollectErrored()` option exists specifically to opt back in — meaning silent data loss is the default behaviour.
@@ -226,20 +278,20 @@ results, err := p.Wait()
 
 `conker` is pre-1.0. The following milestones track progress toward a stable API:
 
-| Milestone  | Theme             | Status  |
-| ---------- | ----------------- | ------- |
-| **v0.1.0** | Foundations       | ✅      |
-| **v0.2.0** | Pool              | ✅      |
-| **v0.3.0** | Stream            | Planned |
-| **v0.4.0** | Iter              | Planned |
-| **v0.5.0** | Daemons & tooling | Planned |
+| Milestone  | Theme             | Status      |
+| ---------- | ----------------- | ----------- |
+| **v0.1.0** | Foundations       | ✅          |
+| **v0.2.0** | Pool              | ✅          |
+| **v0.3.0** | Stream            | In Progress |
+| **v0.4.0** | Iter              | Planned     |
+| **v0.5.0** | Daemons & tooling | Planned     |
 
-Upcoming highlights: `stream.Stream` with ordered concurrent callbacks, and native Go 1.23 `iter.Seq`/`iter.Seq2` support in the `iter` package.
+Upcoming highlights: native Go 1.23 `iter.Seq`/`iter.Seq2` support in the `iter` package.
 
 # Examples
 
 Each example is a self-contained, runnable program. External clients are stubbed so there are no runtime dependencies beyond the Go standard library and `conker` itself.
 
-| Example                                      | Feature              | Use case                                                                                                                                     |
-| -------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Example                                    | Feature              | Use case                                                                                                                                     |
+| ------------------------------------------ | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`etl-pipeline`](./examples/etl-pipeline/) | `pool.ResultPool[T]` | ETL pipeline over an object store — download, transform, upload — with bounded concurrency, per-task timeouts, and submission-order results. |

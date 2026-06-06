@@ -196,7 +196,7 @@ func (p *Pool) runTask(fn func(context.Context) error) {
 // Wait blocks until every submitted task — including tasks submitted
 // recursively by running tasks — has completed. It returns [errors.Join] of
 // all task errors. Panics from tasks are captured and returned as
-// [*panics.Recovered] errors rather than crashing the process.
+// *[panics.Recovered] errors rather than crashing the process.
 func (p *Pool) Wait() error {
 	p.wg.Wait()
 	p.cancel(nil)
