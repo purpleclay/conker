@@ -56,6 +56,10 @@ type Stream struct {
 	dispatchPC    panics.Catcher
 	producerPanic atomic.Pointer[panics.Recovered]
 
+	// producerWg tracks in-flight producer goroutines so Wait can drain them
+	// before returning, even when the dispatcher exits early due to a panic.
+	producerWg sync.WaitGroup
+
 	// cfgMu guards sem, started, and waited, preventing reconfiguration after
 	// the first Go call and making repeated Wait calls a no-op.
 	cfgMu   sync.Mutex
@@ -143,7 +147,9 @@ func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) e
 	slot := make(chan callbackOrPanic, 1)
 	s.submitted <- slot
 
+	s.producerWg.Add(1)
 	go func() {
+		defer s.producerWg.Done()
 		defer func() { <-s.sem }()
 
 		var pc panics.Catcher
@@ -187,6 +193,8 @@ func (s *Stream) Wait() {
 	}
 	s.waited = true
 	s.cfgMu.Unlock()
+
+	defer s.producerWg.Wait()
 
 	if s.submitted == nil {
 		s.cancel(nil)
