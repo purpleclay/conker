@@ -278,13 +278,13 @@ results, err := p.Wait()
 
 `conker` is pre-1.0. The following milestones track progress toward a stable API:
 
-| Milestone  | Theme             | Status      |
-| ---------- | ----------------- | ----------- |
-| **v0.1.0** | Foundations       | ✅          |
-| **v0.2.0** | Pool              | ✅          |
-| **v0.3.0** | Stream            | In Progress |
-| **v0.4.0** | Iter              | Planned     |
-| **v0.5.0** | Daemons & tooling | Planned     |
+| Milestone  | Theme             | Status  |
+| ---------- | ----------------- | ------- |
+| **v0.1.0** | Foundations       | ✅      |
+| **v0.2.0** | Pool              | ✅      |
+| **v0.3.0** | Stream            | ✅      |
+| **v0.4.0** | Iter              | Planned |
+| **v0.5.0** | Daemons & tooling | Planned |
 
 Upcoming highlights: native Go 1.23 `iter.Seq`/`iter.Seq2` support in the `iter` package.
 
@@ -292,6 +292,7 @@ Upcoming highlights: native Go 1.23 `iter.Seq`/`iter.Seq2` support in the `iter`
 
 Each example is a self-contained, runnable program. External clients are stubbed so there are no runtime dependencies beyond the Go standard library and `conker` itself.
 
-| Example                                    | Feature              | Use case                                                                                                                                     |
-| ------------------------------------------ | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| [`etl-pipeline`](./examples/etl-pipeline/) | `pool.ResultPool[T]` | ETL pipeline over an object store — download, transform, upload — with bounded concurrency, per-task timeouts, and submission-order results. |
+| Example                                        | Feature              | Use case                                                                                                                                     |
+| ---------------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`etl-pipeline`](./examples/etl-pipeline/)     | `pool.ResultPool[T]` | ETL pipeline over an object store — download, transform, upload — with bounded concurrency, per-task timeouts, and submission-order results. |
+| [`log-enrichment`](./examples/log-enrichment/) | `stream.Stream`      | Enrich a web server log stream concurrently — resolving each client IP to a country — while preserving the original chronological order.     |
