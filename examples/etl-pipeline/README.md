@@ -1,4 +1,4 @@
-# ETL Pipeline using pool.ResultPool[T]
+# ETL Pipeline using `pool.ResultPool[T]`
 
 An ETL pipeline that processes a continuous stream of objects from a store — download, transform, upload — with bounded concurrency, per-task timeouts, and guaranteed submission-order results.
 
