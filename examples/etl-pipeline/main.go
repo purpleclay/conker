@@ -83,7 +83,8 @@ func main() {
 		WithMaxGoroutines(*workers).
 		WithTaskTimeout(*taskTimeout)
 
-	slog.Info("pipeline started",
+	slog.Info(
+		"pipeline started",
 		"workers", *workers,
 		"task_timeout", *taskTimeout,
 		"run_for", *runFor,

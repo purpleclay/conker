@@ -1,5 +1,5 @@
 # Baseline generated: 2026-05-22
-# Command: go test ./pool -bench 'Benchmark(Pool_Go|ResultPool_Go_.*)$' -benchmem -benchtime=5s -count=5
+# Command: go test ./pool -bench . -benchmem -benchtime=5s -count=5
 # Go: go1.25.0
 # GOOS/GOARCH: darwin/arm64
 # CPU: Apple M4 Pro
