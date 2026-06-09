@@ -1,0 +1,53 @@
+# Baseline generated: 2026-06-08
+# Command: go test ./iter -bench=. -benchmem -benchtime=5s -count=5
+# Go: go1.25.0
+# GOOS/GOARCH: darwin/arm64
+# CPU: Apple M4 Pro
+# GOMAXPROCS: 12
+# Note: regenerate this baseline on CI hardware once the bench workflow is wired up.
+BenchmarkMapSeq/workers=1-12         	   86018	     68130 ns/op	   19114 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=1-12         	   89182	     67589 ns/op	   19112 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=1-12         	   88707	     67388 ns/op	   19112 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=1-12         	   89821	     66797 ns/op	   19112 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=1-12         	   88798	     65958 ns/op	   19112 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=12-12        	  105289	     57119 ns/op	   19202 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=12-12        	  106326	     56905 ns/op	   19201 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=12-12        	  107905	     56381 ns/op	   19202 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=12-12        	  107089	     56245 ns/op	   19202 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=12-12        	  106206	     56201 ns/op	   19201 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=24-12        	   97744	     63873 ns/op	   19298 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=24-12        	   98167	     62140 ns/op	   19298 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=24-12        	   96868	     62365 ns/op	   19298 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=24-12        	   97009	     62231 ns/op	   19297 B/op	     414 allocs/op
+BenchmarkMapSeq/workers=24-12        	   97144	     62350 ns/op	   19298 B/op	     414 allocs/op
+BenchmarkMapSeq2/workers=1-12        	   88981	     67409 ns/op	   21624 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=1-12        	   89089	     67403 ns/op	   21624 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=1-12        	   89322	     67340 ns/op	   21624 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=1-12        	   88520	     67658 ns/op	   21624 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=1-12        	   89040	     67519 ns/op	   21624 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=12-12       	  102648	     58098 ns/op	   21713 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=12-12       	  102166	     58167 ns/op	   21713 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=12-12       	  103677	     58202 ns/op	   21714 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=12-12       	  105277	     59042 ns/op	   21713 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=12-12       	  104175	     58394 ns/op	   21713 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=24-12       	   92899	     62486 ns/op	   21810 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=24-12       	   93632	     64055 ns/op	   21810 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=24-12       	   95307	     63780 ns/op	   21810 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=24-12       	   93682	     63982 ns/op	   21810 B/op	     418 allocs/op
+BenchmarkMapSeq2/workers=24-12       	   97876	     63668 ns/op	   21810 B/op	     418 allocs/op
+BenchmarkForEachSeq/workers=1-12     	  217162	     27837 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=1-12     	  215148	     27961 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=1-12     	  216679	     27855 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=1-12     	  217633	     27885 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=1-12     	  215515	     27837 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=12-12    	  128300	     46645 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=12-12    	  129571	     46804 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=12-12    	  129704	     46443 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=12-12    	  128373	     46486 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=12-12    	  127300	     46543 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=24-12    	  119904	     49667 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=24-12    	  120392	     49417 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=24-12    	  120111	     49825 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=24-12    	  120714	     49449 ns/op	    5856 B/op	     206 allocs/op
+BenchmarkForEachSeq/workers=24-12    	  121052	     49467 ns/op	    5856 B/op	     206 allocs/op
+PASS

@@ -278,15 +278,13 @@ results, err := p.Wait()
 
 `conker` is pre-1.0. The following milestones track progress toward a stable API:
 
-| Milestone  | Theme             | Status  |
-| ---------- | ----------------- | ------- |
-| **v0.1.0** | Foundations       | ✅      |
-| **v0.2.0** | Pool              | ✅      |
-| **v0.3.0** | Stream            | ✅      |
-| **v0.4.0** | Iter              | Planned |
-| **v0.5.0** | Daemons & tooling | Planned |
-
-Upcoming highlights: native Go 1.23 `iter.Seq`/`iter.Seq2` support in the `iter` package.
+| Milestone  | Theme             | Status      |
+| ---------- | ----------------- | ----------- |
+| **v0.1.0** | Foundations       | ✅          |
+| **v0.2.0** | Pool              | ✅          |
+| **v0.3.0** | Stream            | ✅          |
+| **v0.4.0** | Iter              | In Progress |
+| **v0.5.0** | Daemons & tooling | Planned     |
 
 # Examples
 

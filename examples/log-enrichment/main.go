@@ -95,7 +95,8 @@ func main() {
 		if err := s.GoCtx(ctx, func(taskCtx context.Context) stream.Callback {
 			// Enrichment runs concurrently — completions arrive out of order.
 			entry := enrich(taskCtx, resolver, ep.method, ep.path, status, ip)
-			slog.Info("enriched",
+			slog.Info(
+				"enriched",
 				"idx", idx,
 				"ip", entry.IP,
 				"country", entry.Country,
