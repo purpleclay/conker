@@ -263,6 +263,98 @@ func TestForEachSeq_WithMaxGoroutines_LimitsConcurrency(t *testing.T) {
 	})
 }
 
+func TestMapMap_ReturnsResultForEveryPair(t *testing.T) {
+	in := map[string]int{"a": 1, "b": 2, "c": 3}
+	out := conkiter.MapMap(in, func(k string, v int) string { return k + ":" + strconv.Itoa(v) })
+	assert.ElementsMatch(t, []string{"a:1", "b:2", "c:3"}, out)
+}
+
+func TestMapMap_EmptyMap(t *testing.T) {
+	out := conkiter.MapMap(map[string]int{}, func(k string, _ int) string { return k })
+	assert.Empty(t, out)
+}
+
+func TestMapMap_WithMaxGoroutines_LimitsConcurrency(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var concurrent, peak atomic.Int64
+		in := map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6: {}, 7: {}}
+
+		_ = conkiter.MapMap(in, func(k int, _ struct{}) int {
+			n := concurrent.Add(1)
+			for {
+				if cur := peak.Load(); n <= cur || peak.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			concurrent.Add(-1)
+			return k
+		}, conkiter.WithMaxGoroutines(3))
+
+		assert.LessOrEqual(t, peak.Load(), int64(3))
+	})
+}
+
+func TestMapMap_WithContext_StopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var processed atomic.Int64
+	in := map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}, 4: {}}
+	_ = conkiter.MapMap(in, func(k int, _ struct{}) int {
+		processed.Add(1)
+		return k
+	}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(1))
+
+	assert.Equal(t, int64(0), processed.Load(), "pre-cancelled context must dispatch zero elements")
+}
+
+func TestForEachMap_ProcessesAllPairs(t *testing.T) {
+	var count atomic.Int64
+	in := map[string]int{"a": 1, "b": 2, "c": 3}
+	conkiter.ForEachMap(in, func(_ string, _ int) { count.Add(1) })
+	assert.Equal(t, int64(3), count.Load())
+}
+
+func TestForEachMap_EmptyMap(t *testing.T) {
+	var count atomic.Int64
+	conkiter.ForEachMap(map[string]int{}, func(_ string, _ int) { count.Add(1) })
+	assert.Equal(t, int64(0), count.Load())
+}
+
+func TestForEachMap_WithMaxGoroutines_LimitsConcurrency(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var concurrent, peak atomic.Int64
+		in := map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}}
+
+		conkiter.ForEachMap(in, func(_ int, _ struct{}) {
+			n := concurrent.Add(1)
+			for {
+				if cur := peak.Load(); n <= cur || peak.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			concurrent.Add(-1)
+		}, conkiter.WithMaxGoroutines(2))
+
+		assert.LessOrEqual(t, peak.Load(), int64(2))
+	})
+}
+
+func TestForEachMap_WithContext_StopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var processed atomic.Int64
+	in := map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}, 4: {}, 5: {}, 6: {}, 7: {}, 8: {}, 9: {}}
+	conkiter.ForEachMap(in, func(_ int, _ struct{}) {
+		processed.Add(1)
+	}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(1))
+
+	assert.Equal(t, int64(0), processed.Load(), "pre-cancelled context must dispatch zero elements")
+}
+
 func TestWithMaxGoroutines_PanicsOnInvalidN(t *testing.T) {
 	require.Panics(t, func() { conkiter.WithMaxGoroutines(0) })
 	require.Panics(t, func() { conkiter.WithMaxGoroutines(-1) })
