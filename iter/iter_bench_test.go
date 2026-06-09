@@ -68,3 +68,37 @@ func BenchmarkForEachSeq(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMapMap measures the overhead of MapMap relative to MapSeq2: the
+// maps.All adapter plus slices.Collect, across three concurrency levels.
+func BenchmarkMapMap(b *testing.B) {
+	in := make(map[int]struct{}, benchTasks)
+	for i := range benchTasks {
+		in[i] = struct{}{}
+	}
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = conkiter.MapMap(in, func(_ int, v struct{}) struct{} { return v }, conkiter.WithMaxGoroutines(workers))
+			}
+		})
+	}
+}
+
+// BenchmarkForEachMap measures the concurrent foreach overhead over a Go map
+// across three concurrency levels.
+func BenchmarkForEachMap(b *testing.B) {
+	in := make(map[int]struct{}, benchTasks)
+	for i := range benchTasks {
+		in[i] = struct{}{}
+	}
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				conkiter.ForEachMap(in, func(_ int, _ struct{}) {}, conkiter.WithMaxGoroutines(workers))
+			}
+		})
+	}
+}

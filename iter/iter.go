@@ -3,7 +3,9 @@ package iter
 import (
 	"context"
 	stditer "iter"
+	"maps"
 	"runtime"
+	"slices"
 	"sync"
 )
 
@@ -230,4 +232,46 @@ outer:
 		})
 	}
 	wg.Wait()
+}
+
+// MapMap concurrently maps the key-value pairs of in using fn and returns a
+// slice containing one result per pair. Results are not returned in any
+// defined order — Go's map iteration order is intentionally non-deterministic.
+//
+// At most [WithMaxGoroutines] mapping goroutines run concurrently (default:
+// [runtime.GOMAXPROCS](0)).
+//
+// Cancelling the context provided via [WithContext] stops new elements from
+// being dispatched; in-flight mapping goroutines are not interrupted.
+//
+// Example:
+//
+//	counts := iter.MapMap(pages, func(url string, body []byte) int { return len(body) })
+func MapMap[K comparable, V, R any](in map[K]V, fn func(K, V) R, options ...Option) []R {
+	return slices.Collect(MapSeq2(maps.All(in), fn, options...))
+}
+
+// ForEachMap concurrently calls fn for each key-value pair in in. It blocks
+// until all pairs have been processed. Pairs are visited in non-deterministic
+// order — this matches Go's map iteration semantics.
+//
+// At most [WithMaxGoroutines] goroutines run concurrently (default:
+// [runtime.GOMAXPROCS](0)).
+//
+// Cancelling the context provided via [WithContext] stops new elements from
+// being dispatched; in-flight goroutines are not interrupted.
+//
+// Example:
+//
+//	iter.ForEachMap(headers, func(k, v string) {
+//	    log.Printf("%s: %s", k, v)
+//	}, iter.WithMaxGoroutines(8))
+func ForEachMap[K comparable, V any](in map[K]V, fn func(K, V), options ...Option) {
+	ForEachSeq(func(yield func(kvPair[K, V]) bool) {
+		for k, v := range in {
+			if !yield(kvPair[K, V]{k, v}) {
+				return
+			}
+		}
+	}, func(p kvPair[K, V]) { fn(p.k, p.v) }, options...)
 }
