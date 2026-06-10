@@ -2,6 +2,8 @@ package iter_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	stditer "iter"
 	"slices"
 	"strconv"
@@ -353,6 +355,174 @@ func TestForEachMap_WithContext_StopsOnCancel(t *testing.T) {
 	}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(1))
 
 	assert.Equal(t, int64(0), processed.Load(), "pre-cancelled context must dispatch zero elements")
+}
+
+func TestMapSeqErr_TransformsElements(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	out, err := conkiter.MapSeqErr(in, func(_ context.Context, v int) (int, error) { return v * 2, nil })
+	require.NoError(t, err)
+	assert.Equal(t, []int{2, 4, 6, 8, 10}, out)
+}
+
+func TestMapSeqErr_EmptySeq(t *testing.T) {
+	out, err := conkiter.MapSeqErr(slices.Values([]int{}), func(_ context.Context, v int) (int, error) { return v, nil })
+	require.NoError(t, err)
+	assert.Empty(t, out)
+}
+
+func TestMapSeqErr_CollectsErrorsAndResults(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	out, err := conkiter.MapSeqErr(in, func(_ context.Context, v int) (int, error) {
+		if v%2 == 0 {
+			return 99, fmt.Errorf("even: %d", v) // non-zero return alongside error
+		}
+		return v * 2, nil
+	}, conkiter.WithMaxGoroutines(1))
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "even: 2")
+	assert.ErrorContains(t, err, "even: 4")
+	assert.Equal(t, []int{2, 0, 6, 0, 10}, out, "all slots collected; errored elements should have zero values")
+}
+
+func TestMapSeqErr_PreservesSubmissionOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		delays := []time.Duration{3 * time.Second, 1 * time.Second, 2 * time.Second}
+		out, err := conkiter.MapSeqErr(slices.Values(delays), func(_ context.Context, d time.Duration) (time.Duration, error) {
+			time.Sleep(d)
+			return d, nil
+		})
+		require.NoError(t, err)
+		assert.Equal(t, delays, out)
+	})
+}
+
+func TestMapSeqErr_GoverningContextCancelsInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+		}()
+
+		var sawCancel atomic.Bool
+		in := slices.Values([]int{1})
+		_, err := conkiter.MapSeqErr(in, func(fnCtx context.Context, _ int) (int, error) {
+			<-fnCtx.Done()
+			sawCancel.Store(true)
+			return 0, fnCtx.Err()
+		}, conkiter.WithContext(ctx))
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled, "error should be context.Canceled from governing context")
+		assert.True(t, sawCancel.Load(), "fn must observe governing context cancellation")
+	})
+}
+
+func TestMapSeqErr_WithCancelOnError_CancelsInflightWork(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var sawCancel atomic.Bool
+
+		in := slices.Values([]int{1, 2})
+		_, err := conkiter.MapSeqErr(in, func(ctx context.Context, v int) (int, error) {
+			if v == 1 {
+				return 0, errors.New("deliberate error")
+			}
+			<-ctx.Done()
+			sawCancel.Store(true)
+			return 0, nil
+		}, conkiter.WithMaxGoroutines(2), conkiter.WithCancelOnError())
+
+		require.Error(t, err)
+		assert.True(t, sawCancel.Load(), "in-flight work must observe cancellation when a peer errors")
+	})
+}
+
+func TestForEachSeqErr_ProcessesAllElements(t *testing.T) {
+	var count atomic.Int64
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	err := conkiter.ForEachSeqErr(in, func(_ context.Context, _ int) error {
+		count.Add(1)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(5), count.Load())
+}
+
+func TestForEachSeqErr_EmptySeq(t *testing.T) {
+	err := conkiter.ForEachSeqErr(slices.Values([]int{}), func(_ context.Context, _ int) error { return nil })
+	assert.NoError(t, err)
+}
+
+func TestForEachSeqErr_CollectsAllErrors(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3})
+	err := conkiter.ForEachSeqErr(in, func(_ context.Context, v int) error {
+		return fmt.Errorf("error %d", v)
+	}, conkiter.WithMaxGoroutines(3))
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "error 1")
+	assert.ErrorContains(t, err, "error 2")
+	assert.ErrorContains(t, err, "error 3")
+}
+
+func TestForEachSeqErr_GoverningContextCancelsInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+		}()
+
+		var sawCancel atomic.Bool
+		in := slices.Values([]int{1})
+		err := conkiter.ForEachSeqErr(in, func(fnCtx context.Context, _ int) error {
+			<-fnCtx.Done()
+			sawCancel.Store(true)
+			return fnCtx.Err()
+		}, conkiter.WithContext(ctx))
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled, "error should be context.Canceled from governing context")
+		assert.True(t, sawCancel.Load(), "fn must observe governing context cancellation")
+	})
+}
+
+func TestForEachSeqErr_WithCancelOnError_CancelsInflightWork(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var sawCancel atomic.Bool
+
+		in := slices.Values([]int{1, 2})
+		err := conkiter.ForEachSeqErr(in, func(ctx context.Context, v int) error {
+			if v == 1 {
+				return errors.New("deliberate error")
+			}
+			<-ctx.Done()
+			sawCancel.Store(true)
+			return nil
+		}, conkiter.WithMaxGoroutines(2), conkiter.WithCancelOnError())
+
+		require.Error(t, err)
+		assert.True(t, sawCancel.Load(), "in-flight work must observe cancellation when a peer errors")
+	})
+}
+
+func TestWithCancelOnError_LimitsDispatchAfterError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const maxWorkers = 2
+		var dispatched atomic.Int64
+
+		in := slices.Values(make([]int, 20))
+		_ = conkiter.ForEachSeqErr(in, func(_ context.Context, _ int) error {
+			dispatched.Add(1)
+			return errors.New("error")
+		}, conkiter.WithMaxGoroutines(maxWorkers), conkiter.WithCancelOnError())
+
+		assert.LessOrEqual(t, dispatched.Load(), int64(maxWorkers),
+			"WithCancelOnError must stop dispatch beyond the initial in-flight batch")
+	})
 }
 
 func TestWithMaxGoroutines_PanicsOnInvalidN(t *testing.T) {

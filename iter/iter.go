@@ -2,6 +2,7 @@ package iter
 
 import (
 	"context"
+	"errors"
 	stditer "iter"
 	"maps"
 	"runtime"
@@ -15,6 +16,7 @@ type Option func(*opts)
 type opts struct {
 	maxGoroutines int
 	ctx           context.Context
+	cancelOnError bool
 }
 
 // WithMaxGoroutines sets the maximum number of goroutines that may process
@@ -28,12 +30,22 @@ func WithMaxGoroutines(n int) Option {
 
 // WithContext sets the context governing this iteration. When the context is
 // cancelled, no further elements are dispatched; in-flight goroutines are not
-// interrupted.
+// interrupted. In the error-returning variants ([MapSeqErr], [ForEachSeqErr]),
+// cancellation also propagates into in-flight fn calls via the context they
+// receive.
 func WithContext(ctx context.Context) Option {
 	if ctx == nil {
 		panic("iter: WithContext requires non-nil context")
 	}
 	return func(o *opts) { o.ctx = ctx }
+}
+
+// WithCancelOnError stops dispatching new elements and cancels the context
+// passed to in-flight fn calls as soon as any fn call returns a non-nil error.
+// It only takes effect in the error-returning variants: [MapSeqErr] and
+// [ForEachSeqErr].
+func WithCancelOnError() Option {
+	return func(o *opts) { o.cancelOnError = true }
 }
 
 func buildOpts(options []Option) opts {
@@ -274,4 +286,159 @@ func ForEachMap[K comparable, V any](in map[K]V, fn func(K, V), options ...Optio
 			}
 		}
 	}, func(p kvPair[K, V]) { fn(p.k, p.v) }, options...)
+}
+
+// MapSeqErr concurrently maps in using fn, passing a derived context into each
+// call, and returns all results in submission order alongside any joined errors.
+// Results are collected for every element — a result for an errored call holds
+// the zero value of R.
+//
+// At most [WithMaxGoroutines] goroutines run concurrently (default:
+// [runtime.GOMAXPROCS](0)).
+//
+// The context each fn call receives is derived from the context provided via
+// [WithContext]. Cancelling that context stops new elements from being
+// dispatched and propagates into in-flight fn calls via their context argument.
+//
+// [WithCancelOnError] cancels the context passed to all in-flight fn calls as
+// soon as any call returns a non-nil error, and stops further dispatch.
+//
+// Example:
+//
+//	pages, err := iter.MapSeqErr(slices.Values(urls), func(ctx context.Context, url string) ([]byte, error) {
+//	    return fetch(ctx, url)
+//	}, iter.WithMaxGoroutines(8))
+func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, error), options ...Option) ([]R, error) {
+	o := buildOpts(options)
+
+	ctx, cancel := context.WithCancel(o.ctx)
+	defer cancel()
+
+	ordered := make(chan *mapSlot[R], o.maxGoroutines)
+	sem := make(chan struct{}, o.maxGoroutines)
+	var mu sync.Mutex
+	var errs []error
+
+	go func() {
+		defer close(ordered)
+		stopped := func() bool {
+			select {
+			case <-ctx.Done():
+				return true
+			default:
+				return false
+			}
+		}
+		for v := range in {
+			if stopped() {
+				return
+			}
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			if stopped() {
+				<-sem
+				return
+			}
+			s := &mapSlot[R]{done: make(chan struct{})}
+			select {
+			case ordered <- s:
+			case <-ctx.Done():
+				<-sem
+				return
+			}
+			go func(v T, s *mapSlot[R]) {
+				defer func() { <-sem; close(s.done) }()
+				r, err := fn(ctx, v)
+				if err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+					if o.cancelOnError {
+						cancel()
+					}
+					return
+				}
+				s.val = r
+			}(v, s)
+		}
+	}()
+
+	var out []R
+	for s := range ordered {
+		<-s.done
+		out = append(out, s.val)
+	}
+	return out, errors.Join(errs...)
+}
+
+// ForEachSeqErr concurrently calls fn for each element in in, passing a
+// derived context into each call. It blocks until all elements have been
+// processed and returns any joined errors.
+//
+// At most [WithMaxGoroutines] goroutines run concurrently (default:
+// [runtime.GOMAXPROCS](0)).
+//
+// The context each fn call receives is derived from the context provided via
+// [WithContext]. Cancelling that context stops new elements from being
+// dispatched and propagates into in-flight fn calls via their context argument.
+//
+// [WithCancelOnError] cancels the context passed to all in-flight fn calls as
+// soon as any call returns a non-nil error, and stops further dispatch.
+//
+// Example:
+//
+//	err := iter.ForEachSeqErr(slices.Values(items), func(ctx context.Context, item Item) error {
+//	    return process(ctx, item)
+//	}, iter.WithMaxGoroutines(8))
+func ForEachSeqErr[T any](in stditer.Seq[T], fn func(context.Context, T) error, options ...Option) error {
+	o := buildOpts(options)
+
+	ctx, cancel := context.WithCancel(o.ctx)
+	defer cancel()
+
+	sem := make(chan struct{}, o.maxGoroutines)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+
+	stopped := func() bool {
+		select {
+		case <-ctx.Done():
+			return true
+		default:
+			return false
+		}
+	}
+
+outer:
+	for v := range in {
+		if stopped() {
+			break outer
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break outer
+		}
+		if stopped() {
+			<-sem
+			break outer
+		}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			if err := fn(ctx, v); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				if o.cancelOnError {
+					cancel()
+				}
+			}
+		})
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
