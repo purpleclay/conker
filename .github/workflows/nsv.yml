@@ -26,10 +26,10 @@ jobs:
           cachix-token: ${{ secrets.GH_CACHIX }}
 
       - name: GPG Import
-        env:
-          GPG_PRIVATE_KEY: "${{ secrets.GPG_PRIVATE_KEY }}"
-          GPG_PASSPHRASE: "${{ secrets.GPG_PASSPHRASE }}"
-        run: nix run github:purpleclay/gpg-import/7378bf53364cbcb710e797d685f5ef50cf92473b # 0.9.0
+        uses: purpleclay/gpg-import-action@4eee516e10903c7e6e90100597c58daeb6fc394f # v0
+        with:
+          key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
 
       - name: Tag
         run: nix run github:purpleclay/nsv/b1ae852de4507769f2fccb998efb92ab0fcd70c0 -- tag --show # v0.12.2
