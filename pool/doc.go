@@ -6,4 +6,9 @@
 // running tasks to safely submit child tasks into the same pool — [Pool.Wait]
 // waits for the transitive closure of all submitted work, including tasks
 // submitted by tasks that were themselves submitted after Wait was called.
+//
+// [ResultPool] wraps a [Pool] for tasks that produce a typed result. Results
+// are returned in submission order by default, and all results are included —
+// even those from errored or panicking tasks — so nothing is silently dropped.
+// Use [ResultPool.WithUnorderedResults] to skip the ordering step.
 package pool

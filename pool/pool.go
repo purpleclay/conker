@@ -46,14 +46,15 @@ import (
 //	})
 //	p.Wait()
 type Pool struct {
-	sem    chan struct{}
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	sem       chan struct{}
+	wg        sync.WaitGroup
+	parentCtx context.Context
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
 
-	// cfgMu guards sem, started, and taskTimeout, preventing reconfiguration
-	// after the first Go call and ensuring each goroutine captures a stable
-	// semaphore reference.
+	// cfgMu guards sem, started, taskTimeout, and parentCtx, preventing
+	// reconfiguration after the first Go call and ensuring each goroutine
+	// captures a stable semaphore reference.
 	cfgMu       sync.Mutex
 	started     bool
 	taskTimeout time.Duration
@@ -64,10 +65,12 @@ type Pool struct {
 
 // New returns a Pool with a default concurrency limit of [runtime.GOMAXPROCS](0).
 func New() *Pool {
-	ctx, cancel := context.WithCancelCause(context.Background())
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancelCause(parentCtx)
 	return (&Pool{
-		ctx:    ctx,
-		cancel: cancel,
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
 	}).WithMaxGoroutines(runtime.GOMAXPROCS(0))
 }
 
@@ -120,6 +123,40 @@ func (p *Pool) WithTaskTimeout(d time.Duration) *Pool {
 		panic("pool: WithTaskTimeout must be called before Go")
 	}
 	p.taskTimeout = d
+	return p
+}
+
+// WithContext sets the parent context for the pool. The pool's internal
+// context — passed to every task submitted via [Pool.Go], and used as the
+// base for [Pool.WithTaskTimeout] deadlines — is derived from ctx via
+// [context.WithCancelCause]. Cancelling ctx cancels that context, and
+// therefore the context delivered to all in-flight and future tasks; it does
+// not affect ctx itself.
+//
+// Cancellation does not prevent further calls to [Pool.Go] from being
+// accepted — a task may still be submitted and start running with an
+// already-cancelled context. Well-behaved tasks should observe ctx.Done()
+// and return promptly.
+//
+// It panics if ctx is nil or if called after the first [Pool.Go].
+//
+// Example:
+//
+//	p := pool.New().WithContext(ctx) // ctx is the caller's request context
+//	p.Go(func(taskCtx context.Context) error {
+//	    return process(taskCtx) // cancelled if ctx is cancelled
+//	})
+func (p *Pool) WithContext(ctx context.Context) *Pool {
+	if ctx == nil {
+		panic("pool: WithContext requires non-nil context")
+	}
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	if p.started {
+		panic("pool: WithContext must be called before Go")
+	}
+	p.parentCtx = ctx
+	p.ctx, p.cancel = context.WithCancelCause(ctx)
 	return p
 }
 
@@ -208,7 +245,8 @@ func (p *Pool) Wait() error {
 
 // Reset clears all collected errors and reinitialises the internal context,
 // allowing the pool to be reused for another batch of work. Configuration set
-// via [Pool.WithMaxGoroutines] and [Pool.WithTaskTimeout] is preserved.
+// via [Pool.WithMaxGoroutines], [Pool.WithTaskTimeout], and [Pool.WithContext]
+// is preserved.
 //
 // Reset must not be called concurrently with [Pool.Go] or while tasks are
 // running; call it only after [Pool.Wait] has returned.
@@ -216,7 +254,7 @@ func (p *Pool) Reset() {
 	p.mu.Lock()
 	p.errs = nil
 	p.mu.Unlock()
-	p.ctx, p.cancel = context.WithCancelCause(context.Background())
+	p.ctx, p.cancel = context.WithCancelCause(p.parentCtx)
 }
 
 // Errors returns a slice of all errors collected from tasks. This provides
@@ -297,6 +335,13 @@ func (p *ResultPool[T]) WithMaxGoroutines(n int) *ResultPool[T] {
 // See [Pool.WithTaskTimeout] for full documentation.
 func (p *ResultPool[T]) WithTaskTimeout(d time.Duration) *ResultPool[T] {
 	p.pool.WithTaskTimeout(d)
+	return p
+}
+
+// WithContext sets the parent context for the pool.
+// See [Pool.WithContext] for full documentation.
+func (p *ResultPool[T]) WithContext(ctx context.Context) *ResultPool[T] {
+	p.pool.WithContext(ctx)
 	return p
 }
 

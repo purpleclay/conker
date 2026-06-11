@@ -81,7 +81,8 @@ func main() {
 
 	p := pool.NewWithResults[Result]().
 		WithMaxGoroutines(*workers).
-		WithTaskTimeout(*taskTimeout)
+		WithTaskTimeout(*taskTimeout).
+		WithContext(ctx)
 
 	slog.Info(
 		"pipeline started",

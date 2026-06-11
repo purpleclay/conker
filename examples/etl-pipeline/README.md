@@ -17,7 +17,7 @@ You want:
 ## What this example shows
 
 - **Bounded concurrency.** `WithMaxGoroutines` caps in-flight work. A submission beyond the limit blocks at `GoCtx` until a slot frees — natural backpressure with no semaphore code.
-- **Context-aware submission.** `GoCtx(ctx, ...)` returns `ctx.Err()` if the context is cancelled while blocked waiting for a slot. A timeout or SIGINT propagates cleanly through every layer without blocking indefinitely.
+- **Context-aware submission and execution.** `WithContext(ctx)` derives the pool's task context from the run's context, so a timeout or SIGINT cancels in-flight tasks immediately — not just future ones. `GoCtx(ctx, ...)` also returns `ctx.Err()` if the context is cancelled while blocked waiting for a slot, so the submission loop exits cleanly without blocking indefinitely.
 - **Per-task timeout.** `WithTaskTimeout` cancels the context delivered to each task after the deadline. The stub injects latencies of 10–300ms so roughly one-third of tasks time out at the default 200ms, appearing as `context deadline exceeded` in the live output.
 - **Random failures.** The stub returns one of three domain errors (`object corrupted`, `checksum mismatch`, `storage quota exceeded`) on 20% of downloads.
 - **Submission-order results.** Tasks complete in a different order than they were submitted — the live log makes this visible through jumping `idx` values. `ResultPool.Wait()` sorts the results back into submission order before returning, so the final summary is always sequential.
