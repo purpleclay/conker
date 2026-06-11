@@ -398,6 +398,81 @@ func TestPool_WithTaskTimeout_PanicsAfterGo(t *testing.T) {
 	p.Wait() //nolint:errcheck
 }
 
+func TestPool_WithContext_PanicsOnNil(t *testing.T) {
+	assert.Panics(t, func() { pool.New().WithContext(nil) }) //nolint:staticcheck
+}
+
+func TestPool_WithContext_PanicsAfterGo(t *testing.T) {
+	p := pool.New()
+	p.Go(func(_ context.Context) error { return nil })
+
+	assert.Panics(t, func() { p.WithContext(context.Background()) })
+	p.Wait() //nolint:errcheck
+}
+
+func TestPool_WithContext_PropagatesCancellationToTasks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		p := pool.New().WithContext(ctx)
+
+		var taskErr error
+		p.Go(func(taskCtx context.Context) error {
+			select {
+			case <-time.After(time.Second):
+				return nil
+			case <-taskCtx.Done():
+				taskErr = taskCtx.Err()
+				return taskErr
+			}
+		})
+
+		cancel()
+
+		require.Error(t, p.Wait())
+		assert.ErrorIs(t, taskErr, context.Canceled, "cancelling the supplied context must cancel in-flight task contexts")
+	})
+}
+
+func TestPool_WithContext_DoesNotAffectCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := pool.New().WithContext(ctx)
+	p.Go(func(_ context.Context) error { return nil })
+	require.NoError(t, p.Wait())
+
+	assert.NoError(t, ctx.Err(), "the pool must not cancel the caller's context")
+}
+
+func TestPool_Reset_PreservesContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		p := pool.New().WithContext(ctx)
+		p.Go(func(_ context.Context) error { return nil })
+		require.NoError(t, p.Wait())
+
+		p.Reset()
+
+		var taskErr error
+		p.Go(func(taskCtx context.Context) error {
+			select {
+			case <-time.After(time.Second):
+				return nil
+			case <-taskCtx.Done():
+				taskErr = taskCtx.Err()
+				return taskErr
+			}
+		})
+
+		cancel()
+
+		require.Error(t, p.Wait())
+		assert.ErrorIs(t, taskErr, context.Canceled, "the supplied context must still be the parent after reset")
+	})
+}
+
 func TestResultPool_WithCapacity_PanicsOnInvalidN(t *testing.T) {
 	assert.Panics(t, func() { pool.NewWithResults[int]().WithCapacity(0) })
 	assert.Panics(t, func() { pool.NewWithResults[int]().WithCapacity(-1) })
@@ -409,6 +484,30 @@ func TestResultPool_WithCapacity_PanicsAfterGo(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithCapacity(10) })
 	p.Wait() //nolint:errcheck
+}
+
+func TestResultPool_WithContext_PropagatesCancellationToTasks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+
+		p := pool.NewWithResults[error]().WithContext(ctx)
+
+		p.Go(func(taskCtx context.Context) (error, error) {
+			select {
+			case <-time.After(time.Second):
+				return nil, nil
+			case <-taskCtx.Done():
+				return taskCtx.Err(), taskCtx.Err()
+			}
+		})
+
+		cancel()
+
+		results, err := p.Wait()
+		require.Error(t, err)
+		require.Len(t, results, 1)
+		assert.ErrorIs(t, results[0], context.Canceled, "cancelling the supplied context must cancel in-flight task contexts")
+	})
 }
 
 func TestResultPool_WithCapacity_CollectsCorrectResults(t *testing.T) {
