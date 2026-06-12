@@ -21,6 +21,7 @@ go get github.com/purpleclay/conker
 - Use [`conker.WaitGroup`](https://pkg.go.dev/github.com/purpleclay/conker#WaitGroup) if you want a panic-safe replacement for `sync.WaitGroup`.
 - Use [`panics.Catcher`](https://pkg.go.dev/github.com/purpleclay/conker/panics#Catcher) if you want to catch panics in goroutines you manage yourself.
 - Use [`panics.ErrPanic`](https://pkg.go.dev/github.com/purpleclay/conker/panics#ErrPanic) with `errors.Is` to detect recovered panics without a type assertion.
+- Use [`daemon.Pool`](https://pkg.go.dev/github.com/purpleclay/conker/daemon#Pool) if you want long-lived background workers with coordinated cancellation and graceful, bounded shutdown.
 
 # Goals
 
@@ -322,18 +323,6 @@ results := slices.Collect(iter.MapSeq(
 </tr>
 </table>
 
-# Roadmap
-
-`conker` is pre-1.0. The following milestones track progress toward a stable API:
-
-| Milestone  | Theme             | Status  |
-| ---------- | ----------------- | ------- |
-| **v0.1.0** | Foundations       | ✅      |
-| **v0.2.0** | Pool              | ✅      |
-| **v0.3.0** | Stream            | ✅      |
-| **v0.4.0** | Iter              | ✅      |
-| **v0.5.0** | Daemons & tooling | Planned |
-
 # Examples
 
 Each example is a self-contained, runnable program. External clients are stubbed so there are no runtime dependencies beyond the Go standard library and `conker` itself.
@@ -343,3 +332,4 @@ Each example is a self-contained, runnable program. External clients are stubbed
 | [`etl-pipeline`](./examples/etl-pipeline/)     | `pool.ResultPool[T]` | ETL pipeline over an object store — download, transform, upload — with bounded concurrency, per-task timeouts, and submission-order results. |
 | [`log-enrichment`](./examples/log-enrichment/) | `stream.Stream`      | Enrich a web server log stream concurrently — resolving each client IP to a country — while preserving the original chronological order.     |
 | [`fleet-healthcheck`](./examples/fleet-healthcheck/) | `iter.MapSeqErr`     | Concurrently health-check a fixed fleet of hosts, returning results in original fleet order with error aggregation and fail-fast cancellation. |
+| [`background-services`](./examples/background-services/) | `daemon.Pool`        | Run long-lived background workers for a service, with coordinated cancellation, panic isolation, and bounded graceful shutdown. |
