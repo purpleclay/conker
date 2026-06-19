@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+
+	"github.com/purpleclay/conker/panics"
 )
 
 // Option configures concurrent iteration behaviour.
@@ -99,13 +101,14 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 		ordered := make(chan *mapSlot[R], o.maxGoroutines)
 		sem := make(chan struct{}, o.maxGoroutines)
 		done := make(chan struct{})
+		var pc panics.Catcher
 
 		go func() {
 			defer close(ordered)
-			// stopped returns true without blocking if either the consumer has
-			// broken or the context has been cancelled. Used before and after
-			// acquiring the semaphore to prevent dispatching work when both a
-			// free slot and a stop signal are ready (Go's select is otherwise
+			// stopped returns true without blocking if the consumer has broken,
+			// the context has been cancelled, or fn has panicked. Used before and
+			// after acquiring the semaphore to prevent dispatching work when both
+			// a free slot and a stop signal are ready (Go's select is otherwise
 			// non-deterministic in that case).
 			stopped := func() bool {
 				select {
@@ -114,7 +117,7 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 				case <-o.ctx.Done():
 					return true
 				default:
-					return false
+					return pc.Recovered() != nil
 				}
 			}
 			for v := range in {
@@ -146,18 +149,35 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 
 				go func(v T, s *mapSlot[R]) {
 					defer func() { <-sem; close(s.done) }()
-					s.val = fn(v)
+					pc.Try(func() { s.val = fn(v) })
 				}(v, s)
 			}
 		}()
 
+		// panicked tracks whether fn has panicked so done is closed at most
+		// once, and so remaining slots are drained (every in-flight goroutine
+		// joined) without yielding, before re-panicking in this goroutine.
+		var panicked bool
 		for s := range ordered {
 			<-s.done
+			if !panicked && pc.Recovered() != nil {
+				panicked = true
+				close(done)
+			}
+			if panicked {
+				continue
+			}
 			if !yield(s.val) {
 				close(done)
+				// Drain in-flight work so late panics are observed in this goroutine.
+				for s := range ordered {
+					<-s.done
+				}
+				pc.Repanic()
 				return
 			}
 		}
+		pc.Repanic()
 	}
 }
 
@@ -211,16 +231,18 @@ func ForEachSeq[T any](in stditer.Seq[T], fn func(T), options ...Option) {
 	o := buildOpts(options)
 	sem := make(chan struct{}, o.maxGoroutines)
 	var wg sync.WaitGroup
+	var pc panics.Catcher
 
-	// stopped returns true without blocking if the context has been cancelled.
-	// Used before and after acquiring the semaphore to prevent dispatching work
-	// when both a free slot and a stop signal are ready simultaneously.
+	// stopped returns true without blocking if the context has been cancelled
+	// or fn has panicked. Used before and after acquiring the semaphore to
+	// prevent dispatching work when both a free slot and a stop signal are
+	// ready simultaneously.
 	stopped := func() bool {
 		select {
 		case <-o.ctx.Done():
 			return true
 		default:
-			return false
+			return pc.Recovered() != nil
 		}
 	}
 
@@ -240,10 +262,11 @@ outer:
 		}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			fn(v)
+			pc.Try(func() { fn(v) })
 		})
 	}
 	wg.Wait()
+	pc.Repanic()
 }
 
 // MapMap concurrently maps the key-value pairs of in using fn and returns a
@@ -351,7 +374,13 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 			}
 			go func(v T, s *mapSlot[R]) {
 				defer func() { <-sem; close(s.done) }()
-				r, err := fn(ctx, v)
+				var pc panics.Catcher
+				var r R
+				var err error
+				pc.Try(func() { r, err = fn(ctx, v) })
+				if rec := pc.Recovered(); rec != nil {
+					err = rec
+				}
 				if err != nil {
 					mu.Lock()
 					errs = append(errs, err)
@@ -429,7 +458,13 @@ outer:
 		}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			if err := fn(ctx, v); err != nil {
+			var pc panics.Catcher
+			var err error
+			pc.Try(func() { err = fn(ctx, v) })
+			if r := pc.Recovered(); r != nil {
+				err = r
+			}
+			if err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
