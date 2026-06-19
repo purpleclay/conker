@@ -202,7 +202,12 @@ func (p *Pool) GoCtx(ctx context.Context, fn func(context.Context) error) error 
 // Go panics if called on a zero-value Pool; use [New] or call
 // [Pool.WithMaxGoroutines] before submitting tasks.
 func (p *Pool) Go(fn func(context.Context) error) {
-	_ = p.GoCtx(p.ctx, fn)
+	// context.Background(), not p.ctx: Go blocks unconditionally for a slot
+	// and never bails out, even after the pool's own context is cancelled.
+	// Passing p.ctx here would race the always-ready semaphore send against
+	// an already-closed Done channel, silently dropping the submission on
+	// whichever case Go's select happened to pick.
+	_ = p.GoCtx(context.Background(), fn)
 }
 
 func (p *Pool) runTask(fn func(context.Context) error) {
@@ -398,7 +403,8 @@ func (p *ResultPool[T]) GoCtx(ctx context.Context, fn func(context.Context) (T, 
 
 // Go submits fn as a task. It blocks until a goroutine slot is available.
 func (p *ResultPool[T]) Go(fn func(context.Context) (T, error)) {
-	_ = p.GoCtx(p.pool.ctx, fn)
+	// See Pool.Go: must not gate submission on the pool's own context.
+	_ = p.GoCtx(context.Background(), fn)
 }
 
 // Wait blocks until all tasks have completed and returns the collected results

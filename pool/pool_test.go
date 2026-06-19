@@ -445,6 +445,23 @@ func TestPool_WithContext_DoesNotAffectCallerContext(t *testing.T) {
 	assert.NoError(t, ctx.Err(), "the pool must not cancel the caller's context")
 }
 
+func TestPool_Go_AfterContextCancelled_DoesNotDropSubmissions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := pool.New().WithMaxGoroutines(1).WithContext(ctx)
+	cancel()
+
+	var ran atomic.Int32
+	for range 100 {
+		p.Go(func(_ context.Context) error {
+			ran.Add(1)
+			return nil
+		})
+	}
+
+	require.NoError(t, p.Wait())
+	assert.Equal(t, int32(100), ran.Load(), "Go must not silently drop submissions after the pool's context is cancelled")
+}
+
 func TestPool_Reset_PreservesContext(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -508,6 +525,20 @@ func TestResultPool_WithContext_PropagatesCancellationToTasks(t *testing.T) {
 		require.Len(t, results, 1)
 		assert.ErrorIs(t, results[0], context.Canceled, "cancelling the supplied context must cancel in-flight task contexts")
 	})
+}
+
+func TestResultPool_Go_AfterContextCancelled_DoesNotDropResults(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := pool.NewWithResults[int]().WithMaxGoroutines(1).WithContext(ctx)
+	cancel()
+
+	for i := range 100 {
+		p.Go(func(_ context.Context) (int, error) { return i, nil })
+	}
+
+	results, err := p.Wait()
+	require.NoError(t, err)
+	require.Len(t, results, 100, "Go must not silently drop submissions after the pool's context is cancelled")
 }
 
 func TestResultPool_WithCapacity_CollectsCorrectResults(t *testing.T) {
