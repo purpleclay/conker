@@ -17,6 +17,7 @@ import (
 	"go.uber.org/goleak"
 
 	conkiter "github.com/purpleclay/conker/iter"
+	"github.com/purpleclay/conker/panics"
 )
 
 func TestMain(m *testing.M) {
@@ -149,6 +150,53 @@ func TestMapSeq_WithContext_CancelMidStream(t *testing.T) {
 	})
 }
 
+func TestMapSeq_PanicPropagatesToCaller(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		_ = slices.Collect(conkiter.MapSeq(in, func(v int) int {
+			if v == 3 {
+				panic("boom")
+			}
+			return v
+		}, conkiter.WithMaxGoroutines(2)))
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "MapSeq must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
+	assert.ErrorIs(t, r, panics.ErrPanic)
+}
+
+func TestMapSeq_EarlyBreak_LatePanicStillPropagates(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// v=1 sleeps before returning, so the producer dispatches v=2 — which
+		// panics immediately — well before the consumer's first (and only,
+		// since it breaks) yield call for v=1's result.
+		in := slices.Values([]int{1, 2})
+
+		v := func() (val any) {
+			defer func() { val = recover() }()
+			for range conkiter.MapSeq(in, func(v int) int {
+				if v == 2 {
+					panic("boom")
+				}
+				time.Sleep(time.Second)
+				return v
+			}, conkiter.WithMaxGoroutines(2)) {
+				break // break on the first result, while v=2 has already panicked
+			}
+			return nil
+		}()
+
+		r, ok := v.(*panics.Recovered)
+		require.True(t, ok, "MapSeq must re-panic with *panics.Recovered even after an early break, got %T", v)
+		assert.Equal(t, "boom", r.Value)
+	})
+}
+
 func TestMapSeq2_TransformsKeyValuePairs(t *testing.T) {
 	in := func(yield func(string, int) bool) {
 		for _, p := range []struct {
@@ -196,6 +244,31 @@ func TestMapSeq2_PreservesSubmissionOrder(t *testing.T) {
 
 		assert.Equal(t, []int{0, 1, 2}, out)
 	})
+}
+
+func TestMapSeq2_PanicPropagatesToCaller(t *testing.T) {
+	in := func(yield func(int, int) bool) {
+		for i := range 5 {
+			if !yield(i, i) {
+				return
+			}
+		}
+	}
+
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		_ = slices.Collect(conkiter.MapSeq2(stditer.Seq2[int, int](in), func(k, _ int) int {
+			if k == 3 {
+				panic("boom")
+			}
+			return k
+		}, conkiter.WithMaxGoroutines(2)))
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "MapSeq2 must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
 }
 
 func TestForEachSeq_ProcessesAllElements(t *testing.T) {
@@ -265,6 +338,24 @@ func TestForEachSeq_WithMaxGoroutines_LimitsConcurrency(t *testing.T) {
 	})
 }
 
+func TestForEachSeq_PanicPropagatesToCaller(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		conkiter.ForEachSeq(in, func(v int) {
+			if v == 3 {
+				panic("boom")
+			}
+		}, conkiter.WithMaxGoroutines(2))
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "ForEachSeq must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
+}
+
 func TestMapMap_ReturnsResultForEveryPair(t *testing.T) {
 	in := map[string]int{"a": 1, "b": 2, "c": 3}
 	out := conkiter.MapMap(in, func(k string, v int) string { return k + ":" + strconv.Itoa(v) })
@@ -311,6 +402,25 @@ func TestMapMap_WithContext_StopsOnCancel(t *testing.T) {
 	assert.Equal(t, int64(0), processed.Load(), "pre-cancelled context must dispatch zero elements")
 }
 
+func TestMapMap_PanicPropagatesToCaller(t *testing.T) {
+	in := map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}, 4: {}}
+
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		_ = conkiter.MapMap(in, func(k int, _ struct{}) int {
+			if k == 3 {
+				panic("boom")
+			}
+			return k
+		}, conkiter.WithMaxGoroutines(2))
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "MapMap must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
+}
+
 func TestForEachMap_ProcessesAllPairs(t *testing.T) {
 	var count atomic.Int64
 	in := map[string]int{"a": 1, "b": 2, "c": 3}
@@ -355,6 +465,24 @@ func TestForEachMap_WithContext_StopsOnCancel(t *testing.T) {
 	}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(1))
 
 	assert.Equal(t, int64(0), processed.Load(), "pre-cancelled context must dispatch zero elements")
+}
+
+func TestForEachMap_PanicPropagatesToCaller(t *testing.T) {
+	in := map[int]struct{}{0: {}, 1: {}, 2: {}, 3: {}, 4: {}}
+
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		conkiter.ForEachMap(in, func(k int, _ struct{}) {
+			if k == 3 {
+				panic("boom")
+			}
+		}, conkiter.WithMaxGoroutines(2))
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "ForEachMap must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
 }
 
 func TestMapSeqErr_TransformsElements(t *testing.T) {
@@ -439,6 +567,25 @@ func TestMapSeqErr_WithCancelOnError_CancelsInflightWork(t *testing.T) {
 	})
 }
 
+func TestMapSeqErr_PanicCollectedAsError(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	out, err := conkiter.MapSeqErr(in, func(_ context.Context, v int) (int, error) {
+		if v == 3 {
+			panic("boom")
+		}
+		return v * 2, nil
+	}, conkiter.WithMaxGoroutines(1))
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, panics.ErrPanic)
+
+	var r *panics.Recovered
+	require.ErrorAs(t, err, &r)
+	assert.Equal(t, "boom", r.Value)
+
+	assert.Equal(t, []int{2, 4, 0, 8, 10}, out, "all slots collected; the panicking element gets a zero value")
+}
+
 func TestForEachSeqErr_ProcessesAllElements(t *testing.T) {
 	var count atomic.Int64
 	in := slices.Values([]int{1, 2, 3, 4, 5})
@@ -507,6 +654,27 @@ func TestForEachSeqErr_WithCancelOnError_CancelsInflightWork(t *testing.T) {
 		require.Error(t, err)
 		assert.True(t, sawCancel.Load(), "in-flight work must observe cancellation when a peer errors")
 	})
+}
+
+func TestForEachSeqErr_PanicCollectedAsError(t *testing.T) {
+	var count atomic.Int64
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	err := conkiter.ForEachSeqErr(in, func(_ context.Context, v int) error {
+		count.Add(1)
+		if v == 3 {
+			panic("boom")
+		}
+		return nil
+	}, conkiter.WithMaxGoroutines(2))
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, panics.ErrPanic)
+
+	var r *panics.Recovered
+	require.ErrorAs(t, err, &r)
+	assert.Equal(t, "boom", r.Value)
+
+	assert.Equal(t, int64(5), count.Load(), "a peer panicking must not stop other elements from being processed")
 }
 
 func TestWithCancelOnError_LimitsDispatchAfterError(t *testing.T) {

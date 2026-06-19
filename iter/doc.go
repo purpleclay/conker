@@ -14,4 +14,12 @@
 //
 // All functions accept functional options to set the concurrency limit
 // ([WithMaxGoroutines]) and a cancellation context ([WithContext]).
+//
+// fn is always run with panic safety: a panic is recovered on the goroutine
+// that runs fn. In [MapSeq], [MapSeq2], [MapMap], [ForEachSeq], and
+// [ForEachMap], the first panic stops further dispatch and re-panics in the
+// caller's goroutine as a *[panics.Recovered] value once all in-flight work
+// has finished. In [MapSeqErr] and [ForEachSeqErr], a panic is instead
+// converted to its *panics.Recovered error and joined with the other
+// collected errors — detect it with errors.Is(err, [panics.ErrPanic]).
 package iter
