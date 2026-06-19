@@ -3,6 +3,7 @@ package stream_test
 import (
 	"context"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -203,6 +204,51 @@ func TestStream_GoCtx_ReturnsCancelledWhenBlocked(t *testing.T) {
 
 		s.Wait()
 	})
+}
+
+func TestStream_Go_AfterWait_PanicsWithClearMessage(t *testing.T) {
+	s := stream.New()
+	s.Go(func(_ context.Context) stream.Callback { return nil })
+	s.Wait()
+
+	assert.PanicsWithValue(t, "stream: Go called after Wait — Stream is single-shot", func() {
+		s.Go(func(_ context.Context) stream.Callback { return nil })
+	})
+}
+
+func TestStream_GoCtx_AfterWait_PanicsWithClearMessage(t *testing.T) {
+	s := stream.New()
+	s.Go(func(_ context.Context) stream.Callback { return nil })
+	s.Wait()
+
+	assert.PanicsWithValue(t, "stream: Go called after Wait — Stream is single-shot", func() {
+		_ = s.GoCtx(context.Background(), func(_ context.Context) stream.Callback { return nil })
+	})
+}
+
+func TestStream_Go_RacingWithWait_NeverPanicsOnClosedChannel(t *testing.T) {
+	const racers = 10
+
+	for range 200 {
+		s := stream.New().WithMaxGoroutines(4)
+
+		var wg sync.WaitGroup
+		for range racers {
+			wg.Go(func() {
+				defer func() {
+					if r := recover(); r != nil {
+						// The only acceptable panic is our own clear message —
+						// never the raw "send on closed channel" runtime error.
+						assert.Equal(t, "stream: Go called after Wait — Stream is single-shot", r)
+					}
+				}()
+				s.Go(func(_ context.Context) stream.Callback { return nil })
+			})
+		}
+
+		s.Wait()
+		wg.Wait()
+	}
 }
 
 func TestStream_Producer_ReceivesStreamContext(t *testing.T) {
