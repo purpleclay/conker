@@ -3,6 +3,7 @@ package iter
 import (
 	"context"
 	"errors"
+	"fmt"
 	stditer "iter"
 	"maps"
 	"runtime"
@@ -75,6 +76,35 @@ type kvPair[K, V any] struct {
 	k K
 	v V
 }
+
+// ElemError associates an error with the zero-based index of the input
+// element that produced it, in [MapSeqErr] and [ForEachSeqErr]. Use
+// [errors.As] to recover the index of a failing element from the joined
+// error either function returns.
+//
+// Example:
+//
+//	results, err := iter.MapSeqErr(in, fn)
+//	var ee *iter.ElemError
+//	if errors.As(err, &ee) {
+//	    // results[ee.Index] holds the zero value of R.
+//	}
+type ElemError struct {
+	// Index is the zero-based position of the input element that produced Err.
+	Index int
+
+	// Err is the error fn returned, or the panic recovered from it.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *ElemError) Error() string {
+	return fmt.Sprintf("element %d: %v", e.Index, e.Err)
+}
+
+// Unwrap returns the wrapped error, enabling [errors.Is] and [errors.As] to
+// reach through ElemError to Err.
+func (e *ElemError) Unwrap() error { return e.Err }
 
 // MapSeq concurrently maps in using fn and returns a new [iter.Seq] that
 // yields results in the same order as the input. Mapping work is lazy: it
@@ -314,7 +344,10 @@ func ForEachMap[K comparable, V any](in map[K]V, fn func(K, V), options ...Optio
 // MapSeqErr concurrently maps in using fn, passing a derived context into each
 // call, and returns all results in submission order alongside any joined errors.
 // Results are collected for every element — a result for an errored call holds
-// the zero value of R.
+// the zero value of R. Each error is wrapped in an [ElemError] carrying the
+// zero-based index of the element that produced it, so callers can identify
+// which positions in the result slice are holes; use [errors.As] to recover
+// it. Joined errors are ordered by index, regardless of completion order.
 //
 // At most [WithMaxGoroutines] goroutines run concurrently (default:
 // [runtime.GOMAXPROCS](0)).
@@ -340,7 +373,7 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 	ordered := make(chan *mapSlot[R], o.maxGoroutines)
 	sem := make(chan struct{}, o.maxGoroutines)
 	var mu sync.Mutex
-	var errs []error
+	var errs []*ElemError
 
 	go func() {
 		defer close(ordered)
@@ -352,7 +385,10 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 				return false
 			}
 		}
+		var i int
 		for v := range in {
+			idx := i
+			i++
 			if stopped() {
 				return
 			}
@@ -372,7 +408,7 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 				<-sem
 				return
 			}
-			go func(v T, s *mapSlot[R]) {
+			go func(idx int, v T, s *mapSlot[R]) {
 				defer func() { <-sem; close(s.done) }()
 				var pc panics.Catcher
 				var r R
@@ -383,7 +419,7 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 				}
 				if err != nil {
 					mu.Lock()
-					errs = append(errs, err)
+					errs = append(errs, &ElemError{Index: idx, Err: err})
 					mu.Unlock()
 					if o.cancelOnError {
 						cancel()
@@ -391,7 +427,7 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 					return
 				}
 				s.val = r
-			}(v, s)
+			}(idx, v, s)
 		}
 	}()
 
@@ -400,12 +436,21 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 		<-s.done
 		out = append(out, s.val)
 	}
-	return out, errors.Join(errs...)
+
+	slices.SortFunc(errs, func(a, b *ElemError) int { return a.Index - b.Index })
+	joined := make([]error, len(errs))
+	for i, e := range errs {
+		joined[i] = e
+	}
+	return out, errors.Join(joined...)
 }
 
 // ForEachSeqErr concurrently calls fn for each element in in, passing a
 // derived context into each call. It blocks until all elements have been
-// processed and returns any joined errors.
+// processed and returns any joined errors. Each error is wrapped in an
+// [ElemError] carrying the zero-based index of the element that produced it;
+// use [errors.As] to recover it. Joined errors are ordered by index,
+// regardless of completion order.
 //
 // At most [WithMaxGoroutines] goroutines run concurrently (default:
 // [runtime.GOMAXPROCS](0)).
@@ -431,7 +476,7 @@ func ForEachSeqErr[T any](in stditer.Seq[T], fn func(context.Context, T) error, 
 	sem := make(chan struct{}, o.maxGoroutines)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	var errs []error
+	var errs []*ElemError
 
 	stopped := func() bool {
 		select {
@@ -442,8 +487,11 @@ func ForEachSeqErr[T any](in stditer.Seq[T], fn func(context.Context, T) error, 
 		}
 	}
 
+	var i int
 outer:
 	for v := range in {
+		idx := i
+		i++
 		if stopped() {
 			break outer
 		}
@@ -466,7 +514,7 @@ outer:
 			}
 			if err != nil {
 				mu.Lock()
-				errs = append(errs, err)
+				errs = append(errs, &ElemError{Index: idx, Err: err})
 				mu.Unlock()
 				if o.cancelOnError {
 					cancel()
@@ -475,5 +523,11 @@ outer:
 		})
 	}
 	wg.Wait()
-	return errors.Join(errs...)
+
+	slices.SortFunc(errs, func(a, b *ElemError) int { return a.Index - b.Index })
+	joined := make([]error, len(errs))
+	for i, e := range errs {
+		joined[i] = e
+	}
+	return errors.Join(joined...)
 }

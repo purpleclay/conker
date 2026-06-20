@@ -1,11 +1,14 @@
 package iter_test
 
 import (
+	"context"
 	"fmt"
 	stditer "iter"
 	"runtime"
 	"slices"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	conkiter "github.com/purpleclay/conker/iter"
 )
@@ -55,6 +58,22 @@ func BenchmarkMapSeq2(b *testing.B) {
 	}
 }
 
+// BenchmarkMapSeqErr measures the overhead MapSeqErr adds over MapSeq on the
+// all-success path: a derived, cancellable context per call and the
+// mutex-guarded error slice, even though no errors are ever collected.
+func BenchmarkMapSeqErr(b *testing.B) {
+	in := slices.Values(make([]struct{}, benchTasks))
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_, err := conkiter.MapSeqErr(in, func(_ context.Context, v struct{}) (struct{}, error) { return v, nil }, conkiter.WithMaxGoroutines(workers))
+				require.NoError(b, err)
+			}
+		})
+	}
+}
+
 // BenchmarkForEachSeq measures concurrent iteration overhead: semaphore and
 // goroutine coordination with a no-op function, across three concurrency levels.
 func BenchmarkForEachSeq(b *testing.B) {
@@ -64,6 +83,22 @@ func BenchmarkForEachSeq(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				conkiter.ForEachSeq(in, func(_ struct{}) {}, conkiter.WithMaxGoroutines(workers))
+			}
+		})
+	}
+}
+
+// BenchmarkForEachSeqErr measures the overhead ForEachSeqErr adds over
+// ForEachSeq on the all-success path: a derived, cancellable context per call
+// and the mutex-guarded error slice, even though no errors are ever collected.
+func BenchmarkForEachSeqErr(b *testing.B) {
+	in := slices.Values(make([]struct{}, benchTasks))
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				err := conkiter.ForEachSeqErr(in, func(_ context.Context, _ struct{}) error { return nil }, conkiter.WithMaxGoroutines(workers))
+				require.NoError(b, err)
 			}
 		})
 	}
