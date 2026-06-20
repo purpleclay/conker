@@ -513,6 +513,85 @@ func TestMapSeqErr_CollectsErrorsAndResults(t *testing.T) {
 	assert.Equal(t, []int{2, 0, 6, 0, 10}, out, "all slots collected; errored elements should have zero values")
 }
 
+// elemErrors unwraps a joined error into its constituent *iter.ElemError
+// values, in the order errors.Join stored them.
+func elemErrors(t *testing.T, err error) []*conkiter.ElemError {
+	t.Helper()
+	u, ok := err.(interface{ Unwrap() []error })
+	require.True(t, ok, "joined error must implement Unwrap() []error")
+
+	elems := make([]*conkiter.ElemError, 0, len(u.Unwrap()))
+	for _, e := range u.Unwrap() {
+		var ee *conkiter.ElemError
+		require.ErrorAs(t, e, &ee, "each joined error must be an *iter.ElemError")
+		elems = append(elems, ee)
+	}
+	return elems
+}
+
+func TestMapSeqErr_ErrorsCarryElementIndex(t *testing.T) {
+	in := slices.Values([]int{10, 20, 30, 40})
+	_, err := conkiter.MapSeqErr(in, func(_ context.Context, v int) (int, error) {
+		if v == 20 || v == 40 {
+			return 0, fmt.Errorf("bad: %d", v)
+		}
+		return v, nil
+	}, conkiter.WithMaxGoroutines(1))
+
+	require.Error(t, err)
+	elems := elemErrors(t, err)
+	require.Len(t, elems, 2)
+	assert.Equal(t, []int{1, 3}, []int{elems[0].Index, elems[1].Index})
+}
+
+func TestMapSeqErr_ZeroValueHolesMatchElemErrorIndexes(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	out, err := conkiter.MapSeqErr(in, func(_ context.Context, v int) (int, error) {
+		if v%2 == 0 {
+			return 0, fmt.Errorf("even: %d", v)
+		}
+		return v * 2, nil
+	}, conkiter.WithMaxGoroutines(1))
+
+	require.Error(t, err)
+	for _, ee := range elemErrors(t, err) {
+		assert.Zero(t, out[ee.Index], "result at an ElemError index must be the zero value")
+	}
+}
+
+func TestMapSeqErr_PanicWrappedWithElementIndex(t *testing.T) {
+	in := slices.Values([]int{1, 2, 3, 4, 5})
+	_, err := conkiter.MapSeqErr(in, func(_ context.Context, v int) (int, error) {
+		if v == 3 {
+			panic("boom")
+		}
+		return v * 2, nil
+	}, conkiter.WithMaxGoroutines(1))
+
+	require.Error(t, err)
+	var ee *conkiter.ElemError
+	require.ErrorAs(t, err, &ee)
+	assert.Equal(t, 2, ee.Index, "v==3 is the third element, index 2")
+	assert.ErrorIs(t, err, panics.ErrPanic)
+}
+
+func TestMapSeqErr_ErrorsJoinedInIndexOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Submission order is 0,1,2 but completion order is reversed by sleep
+		// duration — a naive completion-order join would list index 2 first.
+		delays := []time.Duration{3 * time.Second, 2 * time.Second, 1 * time.Second}
+		_, err := conkiter.MapSeqErr(slices.Values(delays), func(_ context.Context, d time.Duration) (int, error) {
+			time.Sleep(d)
+			return 0, fmt.Errorf("failed after %s", d)
+		})
+
+		require.Error(t, err)
+		elems := elemErrors(t, err)
+		require.Len(t, elems, 3)
+		assert.Equal(t, []int{0, 1, 2}, []int{elems[0].Index, elems[1].Index, elems[2].Index})
+	})
+}
+
 func TestMapSeqErr_PreservesSubmissionOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		delays := []time.Duration{3 * time.Second, 1 * time.Second, 2 * time.Second}
@@ -612,6 +691,36 @@ func TestForEachSeqErr_CollectsAllErrors(t *testing.T) {
 	assert.ErrorContains(t, err, "error 1")
 	assert.ErrorContains(t, err, "error 2")
 	assert.ErrorContains(t, err, "error 3")
+}
+
+func TestForEachSeqErr_ErrorsCarryElementIndex(t *testing.T) {
+	in := slices.Values([]int{10, 20, 30})
+	err := conkiter.ForEachSeqErr(in, func(_ context.Context, v int) error {
+		if v == 20 {
+			return errors.New("boom")
+		}
+		return nil
+	}, conkiter.WithMaxGoroutines(1))
+
+	require.Error(t, err)
+	var ee *conkiter.ElemError
+	require.ErrorAs(t, err, &ee)
+	assert.Equal(t, 1, ee.Index)
+}
+
+func TestForEachSeqErr_ErrorsJoinedInIndexOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		delays := []time.Duration{3 * time.Second, 2 * time.Second, 1 * time.Second}
+		err := conkiter.ForEachSeqErr(slices.Values(delays), func(_ context.Context, d time.Duration) error {
+			time.Sleep(d)
+			return fmt.Errorf("failed after %s", d)
+		})
+
+		require.Error(t, err)
+		elems := elemErrors(t, err)
+		require.Len(t, elems, 3)
+		assert.Equal(t, []int{0, 1, 2}, []int{elems[0].Index, elems[1].Index, elems[2].Index})
+	})
 }
 
 func TestForEachSeqErr_GoverningContextCancelsInflightFn(t *testing.T) {
