@@ -130,6 +130,19 @@ func (s *Stream) start() {
 				// nil callback is a no-op.
 			}
 		})
+
+		// A panic above (producer or callback) stopped the loop before
+		// submitted was closed. Keep draining so any submitter still blocked
+		// on `submitted <- slot` unblocks; the corresponding slot is always
+		// writable since producers write to it exactly once, buffered.
+		for slot := range s.submitted {
+			cop := <-slot
+			if cop.panic != nil {
+				// A producer panic discovered during drain still outranks an
+				// earlier callback panic — keep that priority intact.
+				s.producerPanic.CompareAndSwap(nil, cop.panic)
+			}
+		}
 	}()
 }
 
