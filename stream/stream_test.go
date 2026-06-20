@@ -119,6 +119,65 @@ func TestStream_CallbackPanic_PropagatesViaWait(t *testing.T) {
 	assert.Equal(t, "callback went wrong", rec.Value)
 }
 
+func TestStream_ProducerPanic_DoesNotDeadlockLateSubmitters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := stream.New().WithMaxGoroutines(1)
+
+		// First producer panics; the dispatcher must keep draining submitted
+		// afterwards or these later Go calls block forever once the buffer
+		// (sized cap(sem)) fills up with undrained slots.
+		s.Go(func(_ context.Context) stream.Callback {
+			panic("producer went wrong")
+		})
+		s.Go(func(_ context.Context) stream.Callback { return nil })
+		s.Go(func(_ context.Context) stream.Callback { return nil })
+
+		assert.Panics(t, s.Wait)
+	})
+}
+
+func TestStream_CallbackPanic_DoesNotDeadlockLateSubmitters(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := stream.New().WithMaxGoroutines(1)
+
+		s.Go(func(_ context.Context) stream.Callback {
+			return func() { panic("callback went wrong") }
+		})
+		s.Go(func(_ context.Context) stream.Callback { return nil })
+		s.Go(func(_ context.Context) stream.Callback { return nil })
+
+		assert.Panics(t, s.Wait)
+	})
+}
+
+func TestStream_ProducerPanicDuringDrain_OutranksEarlierCallbackPanic(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := stream.New().WithMaxGoroutines(1)
+
+		// The callback panic dispatches first; the producer panic is only
+		// discovered afterwards, while the dispatcher drains the remaining
+		// slot. Producer panics must still win — they preserve the original
+		// panic site's stack trace, unlike a re-wrapped callback panic.
+		s.Go(func(_ context.Context) stream.Callback {
+			return func() { panic("callback went wrong") }
+		})
+		s.Go(func(_ context.Context) stream.Callback {
+			panic("producer went wrong")
+		})
+
+		err := func() (r any) {
+			defer func() { r = recover() }()
+			s.Wait()
+			return nil
+		}()
+
+		require.NotNil(t, err)
+		rec, ok := err.(*panics.Recovered)
+		require.True(t, ok, "Wait must re-panic with *panics.Recovered")
+		assert.Equal(t, "producer went wrong", rec.Value, "producer panic must win even when discovered during post-panic drain")
+	})
+}
+
 func TestStream_Wait_EmptyIsNoOp(t *testing.T) {
 	s := stream.New()
 	require.NotPanics(t, s.Wait)
