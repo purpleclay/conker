@@ -27,6 +27,12 @@ type callbackOrPanic struct {
 // in the order their producers were submitted, regardless of when the producers
 // finish.
 //
+// Stream is single-shot: [Stream.Wait] is terminal, and [Stream.Go] /
+// [Stream.GoCtx] panic if called after Wait has been called. Unlike
+// [pool.Pool], callbacks must not submit further work — Stream has no
+// recursive submission support. Use [pool.Pool] for workloads where tasks
+// need to submit child tasks.
+//
 // Example:
 //
 //	s := stream.New().WithMaxGoroutines(4)
@@ -59,6 +65,14 @@ type Stream struct {
 	// producerWg tracks in-flight producer goroutines so Wait can drain them
 	// before returning, even when the dispatcher exits early due to a panic.
 	producerWg sync.WaitGroup
+
+	// submitWg tracks GoCtx calls that were admitted (waited was still false
+	// when they checked) but have not yet finished sending into submitted.
+	// Wait blocks on submitWg before closing submitted, so the channel is
+	// never closed while a send may still be in flight — the check of waited
+	// and the submitWg.Add happen under the same cfgMu critical section as
+	// the waited flip in Wait, so no GoCtx call can be admitted afterwards.
+	submitWg sync.WaitGroup
 
 	// cfgMu guards sem, started, and waited, preventing reconfiguration after
 	// the first Go call and making repeated Wait calls a no-op.
@@ -126,15 +140,23 @@ func (s *Stream) start() {
 // The caller's ctx is used only to unblock the submission wait under
 // backpressure.
 //
-// GoCtx panics if called on a zero-value Stream; use [New] before submitting.
+// GoCtx panics if called on a zero-value Stream, or if called after
+// [Stream.Wait] — Stream is single-shot; use [New] for a fresh one, or
+// [pool.Pool] for workloads where tasks submit further work.
 func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) error {
 	s.cfgMu.Lock()
 	if s.sem == nil {
 		s.cfgMu.Unlock()
 		panic("stream: use New() before calling GoCtx")
 	}
+	if s.waited {
+		s.cfgMu.Unlock()
+		panic("stream: Go called after Wait — Stream is single-shot")
+	}
 	s.started = true
+	s.submitWg.Add(1)
 	s.cfgMu.Unlock()
+	defer s.submitWg.Done()
 
 	s.once.Do(s.start)
 
@@ -168,7 +190,9 @@ func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) e
 // Go submits fn as a producer. It blocks until a goroutine slot is available.
 // The producer receives the stream's internal context.
 //
-// Go panics if called on a zero-value Stream; use [New] before submitting.
+// Go panics if called on a zero-value Stream, or if called after
+// [Stream.Wait] — Stream is single-shot; use [New] for a fresh one, or
+// [pool.Pool] for workloads where tasks submit further work.
 func (s *Stream) Go(fn func(context.Context) Callback) {
 	_ = s.GoCtx(s.ctx, fn)
 }
@@ -184,7 +208,11 @@ func (s *Stream) Go(fn func(context.Context) Callback) {
 // callbacks must fire in submission order, there is no meaningful way to skip
 // a failed slot and resume the sequence.
 //
-// Wait is a no-op when no tasks have been submitted.
+// Wait is terminal: once it returns, the Stream is done and [Stream.Go] /
+// [Stream.GoCtx] panic on any further call, including one made from a
+// callback. Stream has no recursive submission support — use [pool.Pool] for
+// workloads where tasks need to submit child tasks. A second call to Wait is
+// a no-op. Wait is also a no-op when no tasks have been submitted.
 func (s *Stream) Wait() {
 	s.cfgMu.Lock()
 	if s.waited {
@@ -193,6 +221,10 @@ func (s *Stream) Wait() {
 	}
 	s.waited = true
 	s.cfgMu.Unlock()
+
+	// No GoCtx call admitted before the flip above can still be sending into
+	// submitted once this returns, so closing it below is race-free.
+	s.submitWg.Wait()
 
 	defer s.producerWg.Wait()
 
