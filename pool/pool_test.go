@@ -195,6 +195,97 @@ func TestPool_Go_PanicsOnZeroValue(t *testing.T) {
 	})
 }
 
+func TestPool_TryGo_RunsTaskWhenSlotAvailable(t *testing.T) {
+	p := pool.New()
+
+	var ran atomic.Bool
+	ok := p.TryGo(func(_ context.Context) error {
+		ran.Store(true)
+		return nil
+	})
+
+	require.NoError(t, p.Wait())
+	assert.True(t, ok)
+	assert.True(t, ran.Load())
+}
+
+func TestPool_TryGo_ReturnsFalseImmediatelyAtCapacity(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(1)
+
+		// Fill the only slot for 1s of fake time.
+		p.Go(func(_ context.Context) error {
+			time.Sleep(time.Second)
+			return nil
+		})
+
+		start := time.Now()
+		var ran atomic.Bool
+		ok := p.TryGo(func(_ context.Context) error {
+			ran.Store(true)
+			return nil
+		})
+
+		assert.False(t, ok, "TryGo must reject when the pool is at capacity")
+		assert.Zero(t, time.Since(start), "TryGo must never block")
+
+		require.NoError(t, p.Wait())
+		assert.False(t, ran.Load(), "a rejected task must not run")
+	})
+}
+
+func TestPool_TryGo_RecursiveInlineFallbackDoesNotDeadlock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(1)
+
+		var handled atomic.Int64
+		handle := func(_ context.Context) error {
+			handled.Add(1)
+			return nil
+		}
+
+		// The parent holds the only slot, so blocking Go for each child would
+		// deadlock. TryGo lets the parent run saturated children inline.
+		p.Go(func(ctx context.Context) error {
+			for range 5 {
+				if !p.TryGo(handle) {
+					if err := handle(ctx); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		})
+
+		require.NoError(t, p.Wait())
+		assert.Equal(t, int64(5), handled.Load())
+	})
+}
+
+func TestPool_TryGo_CollectsErrors(t *testing.T) {
+	p := pool.New()
+
+	sentinel := errors.New("task failed")
+	require.True(t, p.TryGo(func(_ context.Context) error { return sentinel }))
+
+	assert.ErrorIs(t, p.Wait(), sentinel)
+}
+
+func TestPool_TryGo_PanicsOnZeroValue(t *testing.T) {
+	var p pool.Pool
+	assert.Panics(t, func() {
+		p.TryGo(func(_ context.Context) error { return nil })
+	})
+}
+
+func TestPool_TryGo_PreventsReconfiguration(t *testing.T) {
+	p := pool.New()
+	p.TryGo(func(_ context.Context) error { return nil })
+
+	assert.Panics(t, func() { p.WithMaxGoroutines(4) })
+	p.Wait() //nolint:errcheck
+}
+
 func TestPool_RecursiveSubmission(t *testing.T) {
 	p := pool.New()
 
@@ -993,4 +1084,37 @@ func TestResultPool_WithFirstError_PanicsAfterGo(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithFirstError() })
 	p.Wait() //nolint:errcheck
+}
+
+func TestResultPool_TryGo_RejectedTaskRecordsNoResult(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(1)
+
+		p.Go(func(_ context.Context) (int, error) {
+			time.Sleep(time.Second)
+			return 1, nil
+		})
+		ok := p.TryGo(func(_ context.Context) (int, error) { return 99, nil })
+
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.False(t, ok)
+		assert.Equal(t, []int{1}, results, "a rejected submission must not leave a result behind")
+	})
+}
+
+func TestResultPool_TryGo_PreservesSubmissionOrderAcrossRejection(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(2)
+
+		// Complete in reverse submission order, with a rejection in between.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(3 * time.Second); return 1, nil })
+		require.True(t, p.TryGo(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 2, nil }))
+		require.False(t, p.TryGo(func(_ context.Context) (int, error) { return 99, nil }))
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 3, nil })
+
+		results, err := p.Wait()
+		require.NoError(t, err)
+		assert.Equal(t, []int{1, 2, 3}, results)
+	})
 }
