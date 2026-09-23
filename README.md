@@ -181,6 +181,48 @@ if err := p.Wait(); err != nil { ... }
 </tr>
 </table>
 
+When fail-fast is what you want, opt in with `WithCancelOnError` and `WithFirstError`. The triggering error becomes the `context.Cause` seen by every in-flight task, and `Errors()` still returns every error that occurred.
+
+<table>
+<tr>
+<th><code>errgroup</code></th>
+<th><code>conker</code></th>
+</tr>
+<tr>
+<td>
+
+```go
+g, ctx := errgroup.WithContext(ctx)
+g.SetLimit(10)
+for _, item := range items {
+    g.Go(func() error {
+        return process(ctx, item)
+    })
+}
+if err := g.Wait(); err != nil { ... }
+```
+
+</td>
+<td>
+
+```go
+p := pool.New().
+    WithMaxGoroutines(10).
+    WithContext(ctx).
+    WithCancelOnError().
+    WithFirstError()
+for _, item := range items {
+    p.Go(func(ctx context.Context) error {
+        return process(ctx, item)
+    })
+}
+if err := p.Wait(); err != nil { ... }
+```
+
+</td>
+</tr>
+</table>
+
 ## Concurrent processing with ordered callbacks
 
 Processing items concurrently but emitting results in the original order typically requires buffering everything, sorting by index, and iterating only after all work is done.
