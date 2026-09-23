@@ -398,6 +398,174 @@ func TestPool_WithTaskTimeout_PanicsAfterGo(t *testing.T) {
 	p.Wait() //nolint:errcheck
 }
 
+func TestPool_WithCancelOnError_CancelsInflightTasks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(4).WithCancelOnError()
+		sentinel := errors.New("task failed")
+
+		start := time.Now()
+		var cancelledAfter [3]time.Duration
+		var causes [3]error
+		for i := range 3 {
+			p.Go(func(ctx context.Context) error {
+				select {
+				case <-time.After(time.Hour):
+					return nil
+				case <-ctx.Done():
+					cancelledAfter[i] = time.Since(start)
+					causes[i] = context.Cause(ctx)
+					return ctx.Err()
+				}
+			})
+		}
+		p.Go(func(_ context.Context) error {
+			time.Sleep(time.Second)
+			return sentinel
+		})
+
+		require.ErrorIs(t, p.Wait(), sentinel)
+		for i := range 3 {
+			assert.Equal(t, time.Second, cancelledAfter[i], "in-flight task must be cancelled as soon as a sibling errors")
+			assert.Same(t, sentinel, causes[i], "the triggering error must be the cancellation cause")
+		}
+	})
+}
+
+func TestPool_WithCancelOnError_PanicBecomesCause(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(2).WithCancelOnError()
+
+		var cause error
+		p.Go(func(ctx context.Context) error {
+			select {
+			case <-time.After(time.Hour):
+				return nil
+			case <-ctx.Done():
+				cause = context.Cause(ctx)
+				return ctx.Err()
+			}
+		})
+		p.Go(func(_ context.Context) error { panic("boom") })
+
+		require.ErrorIs(t, p.Wait(), panics.ErrPanic)
+		var rec *panics.Recovered
+		require.ErrorAs(t, cause, &rec, "the recovered panic must be the cancellation cause")
+		assert.Equal(t, "boom", rec.Value)
+	})
+}
+
+func TestPool_WithoutCancelOnError_ErrorDoesNotCancelSiblings(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(2)
+		sentinel := errors.New("task failed")
+
+		var siblingErr error
+		p.Go(func(ctx context.Context) error {
+			time.Sleep(time.Second)
+			siblingErr = ctx.Err()
+			return nil
+		})
+		p.Go(func(_ context.Context) error { return sentinel })
+
+		require.ErrorIs(t, p.Wait(), sentinel)
+		assert.NoError(t, siblingErr, "without WithCancelOnError a task error must not cancel siblings")
+	})
+}
+
+func TestPool_WithCancelOnError_PanicsAfterGo(t *testing.T) {
+	p := pool.New()
+	p.Go(func(_ context.Context) error { return nil })
+
+	assert.Panics(t, func() { p.WithCancelOnError() })
+	p.Wait() //nolint:errcheck
+}
+
+func TestPool_Reset_PreservesCancelOnError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(2).WithCancelOnError()
+		sentinel := errors.New("task failed")
+
+		p.Go(func(_ context.Context) error { return sentinel })
+		require.Error(t, p.Wait())
+
+		p.Reset()
+
+		var cause error
+		p.Go(func(ctx context.Context) error {
+			select {
+			case <-time.After(time.Hour):
+				return nil
+			case <-ctx.Done():
+				cause = context.Cause(ctx)
+				return ctx.Err()
+			}
+		})
+		p.Go(func(_ context.Context) error {
+			time.Sleep(time.Second)
+			return sentinel
+		})
+
+		require.Error(t, p.Wait())
+		assert.Same(t, sentinel, cause, "cancel-on-error must still apply after reset")
+	})
+}
+
+func TestPool_WithFirstError_WaitReturnsOnlyFirstError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(2).WithFirstError()
+
+		errA := errors.New("error a")
+		errB := errors.New("error b")
+
+		// Submit in order but fail in reverse: task B errors first.
+		p.Go(func(_ context.Context) error { time.Sleep(2 * time.Second); return errA })
+		p.Go(func(_ context.Context) error { time.Sleep(1 * time.Second); return errB })
+
+		assert.Same(t, errB, p.Wait(), "Wait must return only the first error recorded")
+		assert.Len(t, p.Errors(), 2, "Errors must still return every error")
+	})
+}
+
+func TestPool_WithFirstError_NilWhenNoErrors(t *testing.T) {
+	p := pool.New().WithFirstError()
+	p.Go(func(_ context.Context) error { return nil })
+
+	assert.NoError(t, p.Wait())
+}
+
+func TestPool_WithFirstError_PanicsAfterGo(t *testing.T) {
+	p := pool.New()
+	p.Go(func(_ context.Context) error { return nil })
+
+	assert.Panics(t, func() { p.WithFirstError() })
+	p.Wait() //nolint:errcheck
+}
+
+func TestPool_WithCancelOnErrorAndFirstError_ReturnsTriggeringError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.New().WithMaxGoroutines(4).WithCancelOnError().WithFirstError()
+		sentinel := errors.New("task failed")
+
+		for range 3 {
+			p.Go(func(ctx context.Context) error {
+				select {
+				case <-time.After(time.Hour):
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			})
+		}
+		p.Go(func(_ context.Context) error {
+			time.Sleep(time.Second)
+			return sentinel
+		})
+
+		assert.Same(t, sentinel, p.Wait(), "Wait must return the triggering error, not a sibling's context.Canceled")
+		assert.Len(t, p.Errors(), 4)
+	})
+}
+
 func TestPool_WithContext_PanicsOnNil(t *testing.T) {
 	assert.Panics(t, func() { pool.New().WithContext(nil) }) //nolint:staticcheck
 }
@@ -764,4 +932,65 @@ func TestResultPool_Reset_PreservesUnorderedResults(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []int{4, 3}, results, "completion order must be preserved after reset")
 	})
+}
+
+func TestResultPool_WithCancelOnError_CancelsInflightTasks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithCancelOnError()
+		sentinel := errors.New("task failed")
+
+		var cause error
+		p.Go(func(ctx context.Context) (int, error) {
+			select {
+			case <-time.After(time.Hour):
+				return 1, nil
+			case <-ctx.Done():
+				cause = context.Cause(ctx)
+				return 1, ctx.Err()
+			}
+		})
+		p.Go(func(_ context.Context) (int, error) {
+			time.Sleep(time.Second)
+			return 2, sentinel
+		})
+
+		results, err := p.Wait()
+		require.ErrorIs(t, err, sentinel)
+		assert.Equal(t, []int{1, 2}, results, "results must still be collected from cancelled tasks")
+		assert.Same(t, sentinel, cause, "the triggering error must be the cancellation cause")
+	})
+}
+
+func TestResultPool_WithCancelOnError_PanicsAfterGo(t *testing.T) {
+	p := pool.NewWithResults[int]()
+	p.Go(func(_ context.Context) (int, error) { return 1, nil })
+
+	assert.Panics(t, func() { p.WithCancelOnError() })
+	p.Wait() //nolint:errcheck
+}
+
+func TestResultPool_WithFirstError_WaitReturnsOnlyFirstError(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithFirstError()
+
+		errA := errors.New("error a")
+		errB := errors.New("error b")
+
+		// Submit in order but fail in reverse: task B errors first.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
+
+		results, err := p.Wait()
+		assert.Same(t, errB, err, "Wait must return only the first error recorded")
+		assert.Equal(t, []int{1, 2}, results)
+		assert.Equal(t, []error{errA, errB}, p.Errors(), "Errors must still return every error")
+	})
+}
+
+func TestResultPool_WithFirstError_PanicsAfterGo(t *testing.T) {
+	p := pool.NewWithResults[int]()
+	p.Go(func(_ context.Context) (int, error) { return 1, nil })
+
+	assert.Panics(t, func() { p.WithFirstError() })
+	p.Wait() //nolint:errcheck
 }

@@ -52,12 +52,14 @@ type Pool struct {
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
 
-	// cfgMu guards sem, started, taskTimeout, and parentCtx, preventing
-	// reconfiguration after the first Go call and ensuring each goroutine
-	// captures a stable semaphore reference.
-	cfgMu       sync.Mutex
-	started     bool
-	taskTimeout time.Duration
+	// cfgMu guards sem, started, taskTimeout, cancelOnError, firstError, and
+	// parentCtx, preventing reconfiguration after the first Go call and
+	// ensuring each goroutine captures a stable semaphore reference.
+	cfgMu         sync.Mutex
+	started       bool
+	taskTimeout   time.Duration
+	cancelOnError bool
+	firstError    bool
 
 	mu   sync.Mutex
 	errs []error
@@ -160,6 +162,61 @@ func (p *Pool) WithContext(ctx context.Context) *Pool {
 	return p
 }
 
+// WithCancelOnError cancels the pool's context — and therefore the context
+// delivered to every in-flight task — as soon as any task returns a non-nil
+// error or panics. The triggering error (or *[panics.Recovered]) is set as the
+// cancellation cause, retrievable from a task via [context.Cause]. If the
+// pool's context was already cancelled — for example, by a parent supplied
+// via [Pool.WithContext] — the existing cause is kept.
+//
+// Cancellation does not prevent further calls to [Pool.Go] from being
+// accepted; later tasks start with an already-cancelled context and should
+// return promptly. All errors, including any [context.Canceled] returned by
+// cancelled siblings, are still collected. Pair with [Pool.WithFirstError] to
+// have [Pool.Wait] return only the triggering error.
+//
+// It panics if called after the first [Pool.Go].
+//
+// Example — fail fast, like errgroup.WithContext:
+//
+//	p := pool.New().WithCancelOnError().WithFirstError()
+//	for _, url := range urls {
+//	    p.Go(func(ctx context.Context) error {
+//	        return fetch(ctx, url) // cancelled once any fetch fails
+//	    })
+//	}
+//	err := p.Wait() // the error that triggered cancellation
+func (p *Pool) WithCancelOnError() *Pool {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	if p.started {
+		panic("pool: WithCancelOnError must be called before Go")
+	}
+	p.cancelOnError = true
+	return p
+}
+
+// WithFirstError makes [Pool.Wait] return only the first error recorded by
+// the pool, rather than [errors.Join] of all task errors. [Pool.Errors] still
+// returns every error.
+//
+// "First" is the order in which the pool records errors, not submission
+// order. When tasks fail at nearly the same moment, which one is recorded
+// first is unspecified. Combined with [Pool.WithCancelOnError], when a task
+// error triggers cancellation, the returned error is the same error in-flight
+// tasks observe via [context.Cause].
+//
+// It panics if called after the first [Pool.Go].
+func (p *Pool) WithFirstError() *Pool {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	if p.started {
+		panic("pool: WithFirstError must be called before Go")
+	}
+	p.firstError = true
+	return p
+}
+
 // GoCtx submits fn as a task, returning [context.Err] if ctx is cancelled
 // while waiting for a goroutine slot. It returns nil on successful submission.
 //
@@ -231,27 +288,36 @@ func (p *Pool) runTask(fn func(context.Context) error) {
 	if err != nil {
 		p.mu.Lock()
 		p.errs = append(p.errs, err)
+		if p.cancelOnError {
+			// Cancel under mu so the cause always matches p.errs[0], even when
+			// two tasks fail concurrently. Only the first cancel takes effect.
+			p.cancel(err)
+		}
 		p.mu.Unlock()
 	}
 }
 
 // Wait blocks until every submitted task — including tasks submitted
 // recursively by running tasks — has completed. It returns [errors.Join] of
-// all task errors. Panics from tasks are captured and returned as
-// *[panics.Recovered] errors rather than crashing the process.
+// all task errors, or only the first with [Pool.WithFirstError]. Panics from
+// tasks are captured and returned as *[panics.Recovered] errors rather than
+// crashing the process.
 func (p *Pool) Wait() error {
 	p.wg.Wait()
 	p.cancel(nil)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.firstError && len(p.errs) > 0 {
+		return p.errs[0]
+	}
 	return errors.Join(p.errs...)
 }
 
 // Reset clears all collected errors and reinitialises the internal context,
 // allowing the pool to be reused for another batch of work. Configuration set
-// via [Pool.WithMaxGoroutines], [Pool.WithTaskTimeout], and [Pool.WithContext]
-// is preserved.
+// via [Pool.WithMaxGoroutines], [Pool.WithTaskTimeout], [Pool.WithContext],
+// [Pool.WithCancelOnError], and [Pool.WithFirstError] is preserved.
 //
 // Reset must not be called concurrently with [Pool.Go] or while tasks are
 // running; call it only after [Pool.Wait] has returned.
@@ -350,6 +416,22 @@ func (p *ResultPool[T]) WithContext(ctx context.Context) *ResultPool[T] {
 	return p
 }
 
+// WithCancelOnError cancels the pool's context as soon as any task errors or
+// panics. Results are still collected from every task, including those that
+// were cancelled. See [Pool.WithCancelOnError] for full documentation.
+func (p *ResultPool[T]) WithCancelOnError() *ResultPool[T] {
+	p.pool.WithCancelOnError()
+	return p
+}
+
+// WithFirstError makes [ResultPool.Wait] return only the first error recorded
+// by the pool. [ResultPool.Errors] still returns every error.
+// See [Pool.WithFirstError] for full documentation.
+func (p *ResultPool[T]) WithFirstError() *ResultPool[T] {
+	p.pool.WithFirstError()
+	return p
+}
+
 // WithCapacity pre-allocates the internal results slice to n, eliminating
 // repeated slice growth allocations when the number of tasks is known
 // upfront. The capacity is retained across [ResultPool.Reset] calls.
@@ -435,8 +517,9 @@ func (p *ResultPool[T]) Wait() ([]T, error) {
 // Reset clears all collected results and errors, reinitialises the submission
 // index, and delegates to [Pool.Reset] to reinitialise the internal context.
 // Configuration set via [ResultPool.WithMaxGoroutines],
-// [ResultPool.WithTaskTimeout], [ResultPool.WithUnorderedResults], and
-// [ResultPool.WithCapacity] is preserved.
+// [ResultPool.WithTaskTimeout], [ResultPool.WithUnorderedResults],
+// [ResultPool.WithCapacity], [ResultPool.WithCancelOnError], and
+// [ResultPool.WithFirstError] is preserved.
 //
 // Reset must not be called concurrently with [ResultPool.Go] or while tasks
 // are running; call it only after [ResultPool.Wait] has returned.
