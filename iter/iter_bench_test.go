@@ -38,6 +38,29 @@ func BenchmarkMapSeq(b *testing.B) {
 	}
 }
 
+// BenchmarkMap compares Map with slices.Collect over MapSeq, the pattern it
+// replaces, across three concurrency levels. Results are ints rather than
+// struct{} so the output slice has real storage, making the saving from
+// pre-allocating it to len(in) visible in B/op and allocs/op.
+func BenchmarkMap(b *testing.B) {
+	in := make([]int, benchTasks)
+	fn := func(v int) int { return v }
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("impl=Map/workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = conkiter.Map(in, fn, conkiter.WithMaxGoroutines(workers))
+			}
+		})
+		b.Run(fmt.Sprintf("impl=Collect/workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = slices.Collect(conkiter.MapSeq(slices.Values(in), fn, conkiter.WithMaxGoroutines(workers)))
+			}
+		})
+	}
+}
+
 // BenchmarkMapSeq2 measures the additional pair-wrapping overhead of MapSeq2
 // relative to MapSeq across three concurrency levels.
 func BenchmarkMapSeq2(b *testing.B) {

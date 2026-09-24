@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	stditer "iter"
+	"runtime"
 	"slices"
 	"strconv"
 	"sync/atomic"
@@ -809,4 +810,207 @@ func TestWithMaxGoroutines_PanicsOnInvalidN(t *testing.T) {
 
 func TestWithContext_PanicsOnNilContext(t *testing.T) {
 	require.Panics(t, func() { conkiter.WithContext(nil) })
+}
+
+func TestMap_PreservesSubmissionOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		delays := []time.Duration{3 * time.Second, 1 * time.Second, 2 * time.Second}
+
+		out := conkiter.Map(delays, func(d time.Duration) time.Duration {
+			time.Sleep(d)
+			return d * 2
+		})
+
+		assert.Equal(t, []time.Duration{6 * time.Second, 2 * time.Second, 4 * time.Second}, out)
+	})
+}
+
+func TestMap_EmptySlice(t *testing.T) {
+	out := conkiter.Map([]int{}, func(v int) int { return v })
+	assert.Empty(t, out)
+}
+
+func TestMap_WithMaxGoroutines_LimitsConcurrency(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var concurrent, peak atomic.Int64
+
+		_ = conkiter.Map([]int{1, 2, 3, 4, 5, 6, 7, 8}, func(v int) int {
+			n := concurrent.Add(1)
+			for {
+				if cur := peak.Load(); n <= cur || peak.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			concurrent.Add(-1)
+			return v
+		}, conkiter.WithMaxGoroutines(3))
+
+		assert.Equal(t, int64(3), peak.Load())
+	})
+}
+
+func TestMap_WithContext_PreCancelledReturnsNoResults(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var processed atomic.Int64
+	out := conkiter.Map([]int{1, 2, 3, 4, 5}, func(v int) int {
+		processed.Add(1)
+		return v
+	}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(1))
+
+	assert.Empty(t, out, "only dispatched elements produce results")
+	assert.Equal(t, int64(0), processed.Load())
+}
+
+func TestMap_WithContext_PreCancelledDoesNotPreallocateOutput(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	in := make([]int, 1<<20) // an 8 MiB output slice if pre-allocated
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	out := conkiter.Map(in, func(v int) int { return v }, conkiter.WithContext(ctx))
+	runtime.ReadMemStats(&after)
+
+	assert.Empty(t, out)
+	assert.Less(t, after.TotalAlloc-before.TotalAlloc, uint64(1<<20),
+		"Map must not allocate the output slice when no element is dispatched")
+}
+
+func TestMap_PanicPropagatesToCaller(t *testing.T) {
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		_ = conkiter.Map([]int{1, 2, 3, 4, 5}, func(v int) int {
+			if v == 3 {
+				panic("boom")
+			}
+			return v
+		}, conkiter.WithMaxGoroutines(2))
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "Map must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
+}
+
+func TestMapErr_PreservesOrderAndIndexesErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		delays := []time.Duration{3 * time.Second, 1 * time.Second, 2 * time.Second}
+
+		out, err := conkiter.MapErr(delays, func(_ context.Context, d time.Duration) (time.Duration, error) {
+			time.Sleep(d)
+			if d == time.Second {
+				return 0, errors.New("boom")
+			}
+			return d, nil
+		})
+
+		require.Error(t, err)
+		elems := elemErrors(t, err)
+		require.Len(t, elems, 1)
+		assert.Equal(t, 1, elems[0].Index)
+		assert.Equal(t, []time.Duration{3 * time.Second, 0, 2 * time.Second}, out)
+	})
+}
+
+func TestMapErr_WithContext_PreCancelledReturnsNoResultsAndNoError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var processed atomic.Int64
+	out, err := conkiter.MapErr([]int{1, 2, 3}, func(_ context.Context, v int) (int, error) {
+		processed.Add(1)
+		return v, nil
+	}, conkiter.WithContext(ctx))
+
+	require.NoError(t, err, "skipped elements are not reported as errors")
+	assert.Empty(t, out, "only dispatched elements produce results")
+	assert.Equal(t, int64(0), processed.Load())
+}
+
+func TestMapErr_FnReceivesGoverningContext(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "governing")
+
+	out, err := conkiter.MapErr([]int{1, 2}, func(ctx context.Context, _ int) (string, error) {
+		v, _ := ctx.Value(key{}).(string)
+		return v, nil
+	}, conkiter.WithContext(ctx))
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"governing", "governing"}, out)
+}
+
+func TestForEach_ProcessesAllElements(t *testing.T) {
+	var sum atomic.Int64
+	conkiter.ForEach([]int{1, 2, 3, 4, 5}, func(v int) { sum.Add(int64(v)) })
+	assert.Equal(t, int64(15), sum.Load())
+}
+
+func TestForEach_WithMaxGoroutines_LimitsConcurrency(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var concurrent, peak atomic.Int64
+
+		conkiter.ForEach([]int{1, 2, 3, 4, 5, 6, 7, 8}, func(_ int) {
+			n := concurrent.Add(1)
+			for {
+				if cur := peak.Load(); n <= cur || peak.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			time.Sleep(100 * time.Millisecond)
+			concurrent.Add(-1)
+		}, conkiter.WithMaxGoroutines(3))
+
+		assert.Equal(t, int64(3), peak.Load())
+	})
+}
+
+func TestForEach_PanicPropagatesToCaller(t *testing.T) {
+	v := func() (val any) {
+		defer func() { val = recover() }()
+		conkiter.ForEach([]int{1, 2, 3}, func(v int) {
+			if v == 2 {
+				panic("boom")
+			}
+		})
+		return nil
+	}()
+
+	r, ok := v.(*panics.Recovered)
+	require.True(t, ok, "ForEach must re-panic with *panics.Recovered, got %T", v)
+	assert.Equal(t, "boom", r.Value)
+}
+
+func TestForEachErr_ErrorsCarryElementIndex(t *testing.T) {
+	err := conkiter.ForEachErr([]int{10, 20, 30}, func(_ context.Context, v int) error {
+		if v == 20 {
+			return errors.New("boom")
+		}
+		return nil
+	})
+
+	require.Error(t, err)
+	var ee *conkiter.ElemError
+	require.ErrorAs(t, err, &ee)
+	assert.Equal(t, 1, ee.Index)
+}
+
+func TestForEachErr_WithCancelOnError_LimitsDispatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const maxWorkers = 2
+		var dispatched atomic.Int64
+
+		_ = conkiter.ForEachErr(make([]int, 20), func(_ context.Context, _ int) error {
+			dispatched.Add(1)
+			return errors.New("error")
+		}, conkiter.WithMaxGoroutines(maxWorkers), conkiter.WithCancelOnError())
+
+		assert.LessOrEqual(t, dispatched.Load(), int64(maxWorkers),
+			"WithCancelOnError must stop dispatch beyond the initial in-flight batch")
+	})
 }

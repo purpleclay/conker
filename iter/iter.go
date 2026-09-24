@@ -33,9 +33,9 @@ func WithMaxGoroutines(n int) Option {
 
 // WithContext sets the context governing this iteration. When the context is
 // cancelled, no further elements are dispatched; in-flight goroutines are not
-// interrupted. In the error-returning variants ([MapSeqErr], [ForEachSeqErr]),
-// cancellation also propagates into in-flight fn calls via the context they
-// receive.
+// interrupted. In the error-returning variants ([MapSeqErr], [ForEachSeqErr],
+// [MapErr], [ForEachErr]), cancellation also propagates into in-flight fn
+// calls via the context they receive.
 func WithContext(ctx context.Context) Option {
 	if ctx == nil {
 		panic("iter: WithContext requires non-nil context")
@@ -45,8 +45,8 @@ func WithContext(ctx context.Context) Option {
 
 // WithCancelOnError stops dispatching new elements and cancels the context
 // passed to in-flight fn calls as soon as any fn call returns a non-nil error.
-// It only takes effect in the error-returning variants: [MapSeqErr] and
-// [ForEachSeqErr].
+// It only takes effect in the error-returning variants: [MapSeqErr],
+// [ForEachSeqErr], [MapErr], and [ForEachErr].
 func WithCancelOnError() Option {
 	return func(o *opts) { o.cancelOnError = true }
 }
@@ -78,7 +78,8 @@ type kvPair[K, V any] struct {
 }
 
 // ElemError associates an error with the zero-based index of the input
-// element that produced it, in [MapSeqErr] and [ForEachSeqErr]. Use
+// element that produced it, in [MapSeqErr], [ForEachSeqErr], [MapErr], and
+// [ForEachErr]. Use
 // [errors.As] to recover the index of a failing element from the joined
 // error either function returns.
 //
@@ -244,13 +245,14 @@ func MapSeq2[K, V, R any](in stditer.Seq2[K, V], fn func(K, V) R, options ...Opt
 }
 
 // ForEachSeq concurrently calls fn for each element in in. It blocks until
-// all elements have been processed.
+// every dispatched element has been processed.
 //
 // At most [WithMaxGoroutines] goroutines run concurrently (default:
 // [runtime.GOMAXPROCS](0)).
 //
 // Cancelling the context provided via [WithContext] stops new elements from
-// being dispatched; in-flight goroutines are not interrupted.
+// being dispatched; in-flight goroutines are not interrupted. Elements not yet
+// dispatched are skipped.
 //
 // Example:
 //
@@ -342,9 +344,9 @@ func ForEachMap[K comparable, V any](in map[K]V, fn func(K, V), options ...Optio
 }
 
 // MapSeqErr concurrently maps in using fn, passing a derived context into each
-// call, and returns all results in submission order alongside any joined errors.
-// Results are collected for every element — a result for an errored call holds
-// the zero value of R. Each error is wrapped in an [ElemError] carrying the
+// call, and returns the results of every dispatched element in submission
+// order alongside any joined errors. A result for an errored call holds the
+// zero value of R. Each error is wrapped in an [ElemError] carrying the
 // zero-based index of the element that produced it, so callers can identify
 // which positions in the result slice are holes; use [errors.As] to recover
 // it. Joined errors are ordered by index, regardless of completion order.
@@ -358,6 +360,10 @@ func ForEachMap[K comparable, V any](in map[K]V, fn func(K, V), options ...Optio
 //
 // [WithCancelOnError] cancels the context passed to all in-flight fn calls as
 // soon as any call returns a non-nil error, and stops further dispatch.
+//
+// When dispatch stops early for either reason, the result holds only the
+// dispatched elements, in order. Skipped elements are not reported as errors;
+// check the context's Err to detect cancellation.
 //
 // Example:
 //
@@ -446,8 +452,8 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 }
 
 // ForEachSeqErr concurrently calls fn for each element in in, passing a
-// derived context into each call. It blocks until all elements have been
-// processed and returns any joined errors. Each error is wrapped in an
+// derived context into each call. It blocks until every dispatched element
+// has been processed and returns any joined errors. Each error is wrapped in an
 // [ElemError] carrying the zero-based index of the element that produced it;
 // use [errors.As] to recover it. Joined errors are ordered by index,
 // regardless of completion order.
@@ -461,6 +467,9 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 //
 // [WithCancelOnError] cancels the context passed to all in-flight fn calls as
 // soon as any call returns a non-nil error, and stops further dispatch.
+//
+// Elements skipped when dispatch stops early for either reason are not
+// reported as errors; check the context's Err to detect cancellation.
 //
 // Example:
 //
@@ -530,4 +539,86 @@ outer:
 		joined[i] = e
 	}
 	return errors.Join(joined...)
+}
+
+// Map concurrently maps in using fn and returns the results in the same order
+// as the input. It is the slice form of [MapSeq]: options, ordering, and panic
+// behaviour are identical. The output slice is allocated with capacity len(in)
+// when the first result arrives; Map returns nil if no result is produced.
+//
+// Cancelling the context provided via [WithContext] stops new elements from
+// being dispatched; in-flight mapping goroutines are not interrupted. The
+// result then holds only the results of dispatched elements, in order.
+//
+// Example:
+//
+//	doubled := iter.Map(nums, func(n int) int { return n * 2 })
+func Map[T, R any](in []T, fn func(T) R, options ...Option) []R {
+	var out []R
+	for r := range MapSeq(slices.Values(in), fn, options...) {
+		if out == nil {
+			// Allocate on the first result, not up front, so a context
+			// cancelled before any dispatch costs nothing.
+			out = make([]R, 0, len(in))
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// MapErr concurrently maps in using fn, passing a derived context into each
+// call, and returns the results of every dispatched element in input order
+// alongside any joined errors. It is the slice form of [MapSeqErr]: options,
+// ordering, [ElemError] indexing, and context behaviour are identical. A
+// result for an errored element holds the zero value of R.
+//
+// Dispatch stops early if the context provided via [WithContext] is
+// cancelled, or if [WithCancelOnError] is set and a call fails. The result
+// then holds only the dispatched elements, in order. Skipped elements are not
+// reported as errors; check the context's Err to detect cancellation.
+//
+// Example:
+//
+//	pages, err := iter.MapErr(urls, func(ctx context.Context, url string) ([]byte, error) {
+//	    return fetch(ctx, url)
+//	}, iter.WithMaxGoroutines(8))
+func MapErr[T, R any](in []T, fn func(context.Context, T) (R, error), options ...Option) ([]R, error) {
+	return MapSeqErr(slices.Values(in), fn, options...)
+}
+
+// ForEach concurrently calls fn for each element in in. It blocks until every
+// dispatched element has been processed. It is the slice form of
+// [ForEachSeq]: options and panic behaviour are identical.
+//
+// Cancelling the context provided via [WithContext] stops new elements from
+// being dispatched; in-flight goroutines are not interrupted. Elements not yet
+// dispatched are skipped.
+//
+// Example:
+//
+//	iter.ForEach(items, func(item Item) {
+//	    process(item)
+//	}, iter.WithMaxGoroutines(8))
+func ForEach[T any](in []T, fn func(T), options ...Option) {
+	ForEachSeq(slices.Values(in), fn, options...)
+}
+
+// ForEachErr concurrently calls fn for each element in in, passing a derived
+// context into each call. It blocks until every dispatched element has been
+// processed and returns any joined errors. It is the slice form of
+// [ForEachSeqErr]: options, [ElemError] indexing, and context behaviour are
+// identical.
+//
+// Dispatch stops early if the context provided via [WithContext] is
+// cancelled, or if [WithCancelOnError] is set and a call fails. Skipped
+// elements are not reported as errors; check the context's Err to detect
+// cancellation.
+//
+// Example:
+//
+//	err := iter.ForEachErr(items, func(ctx context.Context, item Item) error {
+//	    return process(ctx, item)
+//	}, iter.WithMaxGoroutines(8))
+func ForEachErr[T any](in []T, fn func(context.Context, T) error, options ...Option) error {
+	return ForEachSeqErr(slices.Values(in), fn, options...)
 }
