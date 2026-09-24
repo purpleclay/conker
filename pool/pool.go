@@ -82,7 +82,20 @@ func New() *Pool {
 // Warning: if tasks recursively submit child tasks and n is small relative to
 // the recursion depth, every slot may be held by a parent waiting to submit a
 // child while no child can start — a deadlock. The default of
-// runtime.GOMAXPROCS(0) is safe for typical workloads.
+// runtime.GOMAXPROCS(0) is safe for typical workloads. To rule the deadlock
+// out, submit children with [Pool.TryGo] and run them inline when the pool is
+// saturated:
+//
+//	p.Go(func(ctx context.Context) error {
+//	    for _, c := range children {
+//	        if !p.TryGo(handle(c)) {
+//	            if err := handle(c)(ctx); err != nil {
+//	                return err
+//	            }
+//	        }
+//	    }
+//	    return nil
+//	})
 func (p *Pool) WithMaxGoroutines(n int) *Pool {
 	if n <= 0 {
 		panic("pool: WithMaxGoroutines requires n > 0")
@@ -228,14 +241,7 @@ func (p *Pool) WithFirstError() *Pool {
 // GoCtx panics if called on a zero-value Pool; use [New] or call
 // [Pool.WithMaxGoroutines] before submitting tasks.
 func (p *Pool) GoCtx(ctx context.Context, fn func(context.Context) error) error {
-	p.cfgMu.Lock()
-	sem := p.sem
-	if sem == nil {
-		p.cfgMu.Unlock()
-		panic("pool: use New() or call WithMaxGoroutines before GoCtx")
-	}
-	p.started = true
-	p.cfgMu.Unlock()
+	sem := p.semaphore("GoCtx")
 
 	select {
 	case sem <- struct{}{}:
@@ -243,11 +249,53 @@ func (p *Pool) GoCtx(ctx context.Context, fn func(context.Context) error) error 
 		return ctx.Err()
 	}
 
+	p.spawn(sem, fn)
+	return nil
+}
+
+// TryGo submits fn only if a goroutine slot is immediately available, and
+// reports whether it was submitted. TryGo never blocks, making it safe to call
+// from within a running task without risking the recursive-submission deadlock
+// described on [Pool.WithMaxGoroutines].
+//
+// A rejected fn is not run and records no error; the caller decides what to
+// do instead, such as running it inline.
+//
+// TryGo panics if called on a zero-value Pool; use [New] or call
+// [Pool.WithMaxGoroutines] before submitting tasks.
+func (p *Pool) TryGo(fn func(context.Context) error) bool {
+	sem := p.semaphore("TryGo")
+
+	select {
+	case sem <- struct{}{}:
+	default:
+		return false
+	}
+
+	p.spawn(sem, fn)
+	return true
+}
+
+// semaphore returns the pool's semaphore and marks the pool as started,
+// locking out further configuration. It panics on a zero-value Pool, naming
+// the calling submission method.
+func (p *Pool) semaphore(caller string) chan struct{} {
+	p.cfgMu.Lock()
+	defer p.cfgMu.Unlock()
+	if p.sem == nil {
+		panic("pool: use New() or call WithMaxGoroutines before " + caller)
+	}
+	p.started = true
+	return p.sem
+}
+
+// spawn runs fn on a new goroutine that releases its already-acquired slot in
+// sem when done.
+func (p *Pool) spawn(sem chan struct{}, fn func(context.Context) error) {
 	p.wg.Go(func() {
 		defer func() { <-sem }()
 		p.runTask(fn)
 	})
-	return nil
 }
 
 // Go submits fn as a task. It blocks until a goroutine slot is available.
@@ -463,8 +511,29 @@ func (p *ResultPool[T]) WithUnorderedResults() *ResultPool[T] {
 // while waiting for a goroutine slot. The result is always recorded, even
 // when fn returns an error.
 func (p *ResultPool[T]) GoCtx(ctx context.Context, fn func(context.Context) (T, error)) error {
+	return p.pool.GoCtx(ctx, p.task(fn))
+}
+
+// Go submits fn as a task. It blocks until a goroutine slot is available.
+func (p *ResultPool[T]) Go(fn func(context.Context) (T, error)) {
+	// See Pool.Go: must not gate submission on the pool's own context.
+	_ = p.GoCtx(context.Background(), fn)
+}
+
+// TryGo submits fn only if a goroutine slot is immediately available, and
+// reports whether it was submitted. A rejected fn is not run and records no
+// result. See [Pool.TryGo] for full documentation.
+func (p *ResultPool[T]) TryGo(fn func(context.Context) (T, error)) bool {
+	return p.pool.TryGo(p.task(fn))
+}
+
+// task claims the next submission index for fn and wraps it to record its
+// result, even on error or panic. An index claimed by a submission that is
+// then rejected is never recorded; the gap is harmless because results are
+// only sorted by relative index.
+func (p *ResultPool[T]) task(fn func(context.Context) (T, error)) func(context.Context) error {
 	idx := p.idx.Add(1) - 1
-	return p.pool.GoCtx(ctx, func(taskCtx context.Context) error {
+	return func(taskCtx context.Context) error {
 		var (
 			val T
 			err error
@@ -480,13 +549,7 @@ func (p *ResultPool[T]) GoCtx(ctx context.Context, fn func(context.Context) (T, 
 		p.results = append(p.results, indexedResult[T]{idx: idx, val: val, err: err})
 		p.mu.Unlock()
 		return err
-	})
-}
-
-// Go submits fn as a task. It blocks until a goroutine slot is available.
-func (p *ResultPool[T]) Go(fn func(context.Context) (T, error)) {
-	// See Pool.Go: must not gate submission on the pool's own context.
-	_ = p.GoCtx(context.Background(), fn)
+	}
 }
 
 // Wait blocks until all tasks have completed and returns the collected results
