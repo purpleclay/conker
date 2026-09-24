@@ -1,25 +1,18 @@
-// Package iter provides concurrent iteration over Go 1.23 iterators
-// ([iter.Seq] and [iter.Seq2]) and Go maps.
+// Package iter provides concurrent iteration over slices, Go 1.23 iterators
+// ([iter.Seq] and [iter.Seq2]), and Go maps, with bounded concurrency and
+// results in input order.
 //
-// Use [MapSeq] to transform a sequence concurrently while preserving order,
-// [MapSeq2] for key-value pairs, [ForEachSeq] to run a side-effecting
-// function over each element, [MapMap] to map over a Go map concurrently,
-// and [ForEachMap] for side effects over a map.
+// Each operation comes in a form per input: [Map] and [ForEach] for slices,
+// [MapSeq] and [ForEachSeq] for sequences, [MapSeq2] for key-value sequences,
+// and [MapMap] and [ForEachMap] for maps. Maps have no defined order.
 //
-// For error-returning and context-aware variants, use [MapSeqErr] and
-// [ForEachSeqErr]. These pass a derived context into each fn call and collect
-// errors via [errors.Join]. [WithCancelOnError] stops further dispatch and
-// cancels the derived context for in-flight fn calls as soon as any fn call
-// returns a non-nil error.
+// Functions whose names end in Err pass a context into fn, derived from
+// [WithContext], and collect errors via [errors.Join], each wrapped in an
+// [ElemError] carrying the element's index. [WithCancelOnError] makes them
+// fail fast. The other functions do not give fn a context; [WithContext]
+// only stops new elements from being dispatched.
 //
-// All functions accept functional options to set the concurrency limit
-// ([WithMaxGoroutines]) and a cancellation context ([WithContext]).
-//
-// fn is always run with panic safety: a panic is recovered on the goroutine
-// that runs fn. In [MapSeq], [MapSeq2], [MapMap], [ForEachSeq], and
-// [ForEachMap], the first panic stops further dispatch and re-panics in the
-// caller's goroutine as a *[panics.Recovered] value once all in-flight work
-// has finished. In [MapSeqErr] and [ForEachSeqErr], a panic is instead
-// converted to its *panics.Recovered error and joined with the other
-// collected errors — detect it with errors.Is(err, [panics.ErrPanic]).
+// Panics in fn are always recovered. Err functions return them as
+// *[panics.Recovered] errors; the others stop dispatch and re-panic in the
+// caller's goroutine once in-flight work has finished.
 package iter

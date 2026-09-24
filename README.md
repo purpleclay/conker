@@ -15,9 +15,10 @@ go get github.com/purpleclay/conker
 - Use [`pool.Pool`](https://pkg.go.dev/github.com/purpleclay/conker/pool#Pool) if you want bounded, panic-safe concurrent task execution with recursive submission and error aggregation.
 - Use [`pool.ResultPool[T]`](https://pkg.go.dev/github.com/purpleclay/conker/pool#ResultPool) if tasks produce typed results and you want them back in submission order.
 - Use [`stream.Stream`](https://pkg.go.dev/github.com/purpleclay/conker/stream#Stream) if you want concurrent producers with callbacks that execute strictly in submission order, each blocking until its slot's turn arrives.
+- Use [`iter.Map`](https://pkg.go.dev/github.com/purpleclay/conker/iter#Map) / [`iter.ForEach`](https://pkg.go.dev/github.com/purpleclay/conker/iter#ForEach) if you want to concurrently transform or iterate a slice, with results in input order.
 - Use [`iter.MapSeq`](https://pkg.go.dev/github.com/purpleclay/conker/iter#MapSeq) / [`iter.MapSeq2`](https://pkg.go.dev/github.com/purpleclay/conker/iter#MapSeq2) / [`iter.MapMap`](https://pkg.go.dev/github.com/purpleclay/conker/iter#MapMap) if you want to concurrently transform a sequence, `iter.Seq2`, or map, with results in order by default.
 - Use [`iter.ForEachSeq`](https://pkg.go.dev/github.com/purpleclay/conker/iter#ForEachSeq) / [`iter.ForEachMap`](https://pkg.go.dev/github.com/purpleclay/conker/iter#ForEachMap) if you want concurrent side effects over a sequence or map, bounded by `WithMaxGoroutines`.
-- Use [`iter.MapSeqErr`](https://pkg.go.dev/github.com/purpleclay/conker/iter#MapSeqErr) / [`iter.ForEachSeqErr`](https://pkg.go.dev/github.com/purpleclay/conker/iter#ForEachSeqErr) if those operations can fail — errors are joined via `errors.Join`, and `WithCancelOnError` cancels in-flight work on the first error.
+- Use [`iter.MapErr`](https://pkg.go.dev/github.com/purpleclay/conker/iter#MapErr) / [`iter.ForEachErr`](https://pkg.go.dev/github.com/purpleclay/conker/iter#ForEachErr) (or [`iter.MapSeqErr`](https://pkg.go.dev/github.com/purpleclay/conker/iter#MapSeqErr) / [`iter.ForEachSeqErr`](https://pkg.go.dev/github.com/purpleclay/conker/iter#ForEachSeqErr) for sequences) if those operations can fail — errors are joined via `errors.Join`, and `WithCancelOnError` cancels in-flight work on the first error.
 - Use [`conker.WaitGroup`](https://pkg.go.dev/github.com/purpleclay/conker#WaitGroup) if you want a panic-safe replacement for `sync.WaitGroup`.
 - Use [`panics.Catcher`](https://pkg.go.dev/github.com/purpleclay/conker/panics#Catcher) if you want to catch panics in goroutines you manage yourself.
 - Use [`panics.ErrPanic`](https://pkg.go.dev/github.com/purpleclay/conker/panics#ErrPanic) with `errors.Is` to detect recovered panics without a type assertion.
@@ -324,7 +325,7 @@ results, err := p.Wait()
 
 Mapping over a slice concurrently while preserving order is a common pattern, but doing it correctly means hand-rolling an index-based result slice, a semaphore for bounded concurrency, and a `WaitGroup` — repeated in every codebase that needs it.
 
-`iter.MapSeq` (and `iter.MapSeq2` / `iter.MapMap` for `iter.Seq2` and Go maps) does this once: bounded concurrency via `WithMaxGoroutines`, results in original order, and `iter.MapSeqErr` / `iter.ForEachSeqErr` for error-returning, context-aware variants with `errors.Join` aggregation.
+`iter.Map` (and `iter.MapSeq` / `iter.MapSeq2` / `iter.MapMap` for `iter.Seq`, `iter.Seq2`, and Go maps) does this once: bounded concurrency via `WithMaxGoroutines`, results in original order, and `iter.MapErr` / `iter.ForEachErr` (or their `Seq` forms) for error-returning, context-aware variants with `errors.Join` aggregation.
 
 <table>
 <tr>
@@ -354,11 +355,7 @@ wg.Wait()
 <td>
 
 ```go
-results := slices.Collect(iter.MapSeq(
-    slices.Values(urls),
-    fetch,
-    iter.WithMaxGoroutines(8),
-))
+results := iter.Map(urls, fetch, iter.WithMaxGoroutines(8))
 ```
 
 </td>
