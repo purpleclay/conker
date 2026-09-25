@@ -38,6 +38,22 @@ func BenchmarkMapSeq(b *testing.B) {
 	}
 }
 
+// BenchmarkMapSeqCtx measures the cost of cancellation support relative to
+// BenchmarkMapSeq: a derived, cancellable context per call, and a live Done
+// channel checked on every dispatch. MapSeq2Ctx, MapMapCtx, and MapCtx wrap
+// the same path.
+func BenchmarkMapSeqCtx(b *testing.B) {
+	in := slices.Values(make([]struct{}, benchTasks))
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = slices.Collect(conkiter.MapSeqCtx(in, func(_ context.Context, v struct{}) struct{} { return v }, conkiter.WithMaxGoroutines(workers)))
+			}
+		})
+	}
+}
+
 // BenchmarkMap compares Map with slices.Collect over MapSeq, the pattern it
 // replaces, across three concurrency levels. Results are ints rather than
 // struct{} so the output slice has real storage, making the saving from
@@ -106,6 +122,22 @@ func BenchmarkForEachSeq(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				conkiter.ForEachSeq(in, func(_ struct{}) {}, conkiter.WithMaxGoroutines(workers))
+			}
+		})
+	}
+}
+
+// BenchmarkForEachSeqCtx measures the cost of cancellation support relative to
+// BenchmarkForEachSeq: a derived, cancellable context per call, and a live
+// Done channel checked on every dispatch. ForEachMapCtx and ForEachCtx wrap
+// the same path.
+func BenchmarkForEachSeqCtx(b *testing.B) {
+	in := slices.Values(make([]struct{}, benchTasks))
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				conkiter.ForEachSeqCtx(in, func(_ context.Context, _ struct{}) {}, conkiter.WithMaxGoroutines(workers))
 			}
 		})
 	}
