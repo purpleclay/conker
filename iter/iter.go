@@ -33,9 +33,9 @@ func WithMaxGoroutines(n int) Option {
 
 // WithContext sets the context governing this iteration. When the context is
 // cancelled, no further elements are dispatched; in-flight goroutines are not
-// interrupted. In the error-returning variants ([MapSeqErr], [ForEachSeqErr],
-// [MapErr], [ForEachErr]), cancellation also propagates into in-flight fn
-// calls via the context they receive.
+// interrupted. In the functions whose fn takes a context — those ending in Ctx
+// or Err — cancellation also propagates into in-flight fn calls via the
+// context they receive.
 func WithContext(ctx context.Context) Option {
 	if ctx == nil {
 		panic("iter: WithContext requires non-nil context")
@@ -118,6 +118,7 @@ func (e *ElemError) Unwrap() error { return e.Err }
 //
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight mapping goroutines are not interrupted.
+// Use [MapSeqCtx] when fn needs to observe cancellation.
 //
 // Example:
 //
@@ -126,13 +127,77 @@ func (e *ElemError) Unwrap() error { return e.Err }
 //	    fmt.Println(v)
 //	}
 func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stditer.Seq[R] {
+	return mapSeq(in, fn, nil, options)
+}
+
+// MapSeqCtx is [MapSeq] with a context passed into each fn call, so in-flight
+// work can observe cancellation rather than only stopping dispatch.
+//
+// The context is derived from the one provided via [WithContext] and is
+// cancelled when that context is cancelled, when the caller breaks out of the
+// range, or when any fn call panics. Breaking out of the range still waits
+// for in-flight calls to return, so fn should observe ctx.Done() to return
+// promptly.
+//
+// Example:
+//
+//	pages := iter.MapSeqCtx(slices.Values(urls), func(ctx context.Context, url string) []byte {
+//	    return fetch(ctx, url)
+//	}, iter.WithMaxGoroutines(8))
+//	for page := range pages {
+//	    if done(page) {
+//	        break // cancels the context of every in-flight fetch
+//	    }
+//	}
+func MapSeqCtx[T, R any](in stditer.Seq[T], fn func(context.Context, T) R, options ...Option) stditer.Seq[R] {
+	return mapSeq(in, nil, fn, options)
+}
+
+// mapRun is the state shared by one mapSeq call's dispatcher and workers.
+// Workers capture a single pointer to it rather than each field separately,
+// keeping the per-element goroutine closure small.
+type mapRun[T, R any] struct {
+	fn     func(T) R
+	fnCtx  func(context.Context, T) R
+	ctx    context.Context
+	cancel context.CancelFunc
+	sem    chan struct{}
+	pc     panics.Catcher
+}
+
+// call invokes whichever of fn and fnCtx is set, without an adapter closure,
+// storing the result in s.
+func (r *mapRun[T, R]) call(v T, s *mapSlot[R]) {
+	if r.fnCtx != nil {
+		s.val = r.fnCtx(r.ctx, v)
+		return
+	}
+	s.val = r.fn(v)
+}
+
+// mapSeq implements [MapSeq] and [MapSeqCtx]; exactly one of fn and fnCtx is
+// non-nil. With fn, no derived context is created: the governing context is
+// used directly, keeping context.Background's nil Done channel, which select
+// skips for free, on the context-free hot path.
+func mapSeq[T, R any](in stditer.Seq[T], fn func(T) R, fnCtx func(context.Context, T) R, options []Option) stditer.Seq[R] {
 	return func(yield func(R) bool) {
 		o := buildOpts(options)
 
+		r := &mapRun[T, R]{
+			fn:     fn,
+			fnCtx:  fnCtx,
+			ctx:    o.ctx,
+			cancel: func() {},
+			sem:    make(chan struct{}, o.maxGoroutines),
+		}
+		if fnCtx != nil {
+			r.ctx, r.cancel = context.WithCancel(o.ctx)
+		}
+		defer r.cancel()
+
+		ctx, sem, pc := r.ctx, r.sem, &r.pc
 		ordered := make(chan *mapSlot[R], o.maxGoroutines)
-		sem := make(chan struct{}, o.maxGoroutines)
 		done := make(chan struct{})
-		var pc panics.Catcher
 
 		go func() {
 			defer close(ordered)
@@ -145,7 +210,7 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 				select {
 				case <-done:
 					return true
-				case <-o.ctx.Done():
+				case <-ctx.Done():
 					return true
 				default:
 					return pc.Recovered() != nil
@@ -159,7 +224,7 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 				case sem <- struct{}{}:
 				case <-done:
 					return
-				case <-o.ctx.Done():
+				case <-ctx.Done():
 					return
 				}
 				if stopped() {
@@ -178,10 +243,13 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 					return
 				}
 
-				go func(v T, s *mapSlot[R]) {
-					defer func() { <-sem; close(s.done) }()
-					pc.Try(func() { s.val = fn(v) })
-				}(v, s)
+				go func(r *mapRun[T, R], v T, s *mapSlot[R]) {
+					defer func() { <-r.sem; close(s.done) }()
+					r.pc.Try(func() { r.call(v, s) })
+					if r.pc.Recovered() != nil {
+						r.cancel() // stop in-flight siblings as well as dispatch
+					}
+				}(r, v, s)
 			}
 		}()
 
@@ -200,6 +268,7 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 			}
 			if !yield(s.val) {
 				close(done)
+				r.cancel() // reach in-flight fn calls before draining them
 				// Drain in-flight work so late panics are observed in this goroutine.
 				for s := range ordered {
 					<-s.done
@@ -223,6 +292,7 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 //
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight mapping goroutines are not interrupted.
+// Use [MapSeq2Ctx] when fn needs to observe cancellation.
 //
 // Example:
 //
@@ -244,6 +314,24 @@ func MapSeq2[K, V, R any](in stditer.Seq2[K, V], fn func(K, V) R, options ...Opt
 	)
 }
 
+// MapSeq2Ctx is [MapSeq2] with a context passed into each fn call. The
+// context is cancelled on the same conditions as [MapSeqCtx]: when the
+// [WithContext] context is cancelled, the caller breaks out of the range, or
+// any fn call panics.
+func MapSeq2Ctx[K, V, R any](in stditer.Seq2[K, V], fn func(context.Context, K, V) R, options ...Option) stditer.Seq[R] {
+	return MapSeqCtx(
+		func(yield func(kvPair[K, V]) bool) {
+			for k, v := range in {
+				if !yield(kvPair[K, V]{k, v}) {
+					return
+				}
+			}
+		},
+		func(ctx context.Context, p kvPair[K, V]) R { return fn(ctx, p.k, p.v) },
+		options...,
+	)
+}
+
 // ForEachSeq concurrently calls fn for each element in in. It blocks until
 // every dispatched element has been processed.
 //
@@ -253,6 +341,7 @@ func MapSeq2[K, V, R any](in stditer.Seq2[K, V], fn func(K, V) R, options ...Opt
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight goroutines are not interrupted. Elements not yet
 // dispatched are skipped.
+// Use [ForEachSeqCtx] when fn needs to observe cancellation.
 //
 // Example:
 //
@@ -260,10 +349,63 @@ func MapSeq2[K, V, R any](in stditer.Seq2[K, V], fn func(K, V) R, options ...Opt
 //	    process(item)
 //	}, iter.WithMaxGoroutines(8))
 func ForEachSeq[T any](in stditer.Seq[T], fn func(T), options ...Option) {
+	forEachSeq(in, fn, nil, options)
+}
+
+// ForEachSeqCtx is [ForEachSeq] with a context passed into each fn call, so
+// in-flight work can observe cancellation rather than only stopping dispatch.
+// The context is derived from the one provided via [WithContext] and is
+// cancelled when that context is cancelled or when any fn call panics.
+//
+// Example:
+//
+//	iter.ForEachSeqCtx(slices.Values(items), func(ctx context.Context, item Item) {
+//	    process(ctx, item)
+//	}, iter.WithContext(ctx), iter.WithMaxGoroutines(8))
+func ForEachSeqCtx[T any](in stditer.Seq[T], fn func(context.Context, T), options ...Option) {
+	forEachSeq(in, nil, fn, options)
+}
+
+// forEachRun is the state shared by one forEachSeq call's dispatcher and
+// workers; see mapRun.
+type forEachRun[T any] struct {
+	fn     func(T)
+	fnCtx  func(context.Context, T)
+	ctx    context.Context
+	cancel context.CancelFunc
+	sem    chan struct{}
+	pc     panics.Catcher
+}
+
+// call invokes whichever of fn and fnCtx is set, without an adapter closure.
+func (r *forEachRun[T]) call(v T) {
+	if r.fnCtx != nil {
+		r.fnCtx(r.ctx, v)
+		return
+	}
+	r.fn(v)
+}
+
+// forEachSeq implements [ForEachSeq] and [ForEachSeqCtx]; exactly one of fn
+// and fnCtx is non-nil. See mapSeq for why the context-free path skips
+// deriving a cancellable context.
+func forEachSeq[T any](in stditer.Seq[T], fn func(T), fnCtx func(context.Context, T), options []Option) {
 	o := buildOpts(options)
-	sem := make(chan struct{}, o.maxGoroutines)
+
+	r := &forEachRun[T]{
+		fn:     fn,
+		fnCtx:  fnCtx,
+		ctx:    o.ctx,
+		cancel: func() {},
+		sem:    make(chan struct{}, o.maxGoroutines),
+	}
+	if fnCtx != nil {
+		r.ctx, r.cancel = context.WithCancel(o.ctx)
+	}
+	defer r.cancel()
+
+	ctx, sem, pc := r.ctx, r.sem, &r.pc
 	var wg sync.WaitGroup
-	var pc panics.Catcher
 
 	// stopped returns true without blocking if the context has been cancelled
 	// or fn has panicked. Used before and after acquiring the semaphore to
@@ -271,7 +413,7 @@ func ForEachSeq[T any](in stditer.Seq[T], fn func(T), options ...Option) {
 	// ready simultaneously.
 	stopped := func() bool {
 		select {
-		case <-o.ctx.Done():
+		case <-ctx.Done():
 			return true
 		default:
 			return pc.Recovered() != nil
@@ -285,7 +427,7 @@ outer:
 		}
 		select {
 		case sem <- struct{}{}:
-		case <-o.ctx.Done():
+		case <-ctx.Done():
 			break outer
 		}
 		if stopped() {
@@ -293,8 +435,11 @@ outer:
 			break outer
 		}
 		wg.Go(func() {
-			defer func() { <-sem }()
-			pc.Try(func() { fn(v) })
+			defer func() { <-r.sem }()
+			r.pc.Try(func() { r.call(v) })
+			if r.pc.Recovered() != nil {
+				r.cancel() // stop in-flight siblings as well as dispatch
+			}
 		})
 	}
 	wg.Wait()
@@ -310,6 +455,7 @@ outer:
 //
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight mapping goroutines are not interrupted.
+// Use [MapMapCtx] when fn needs to observe cancellation.
 //
 // Example:
 //
@@ -327,6 +473,7 @@ func MapMap[K comparable, V, R any](in map[K]V, fn func(K, V) R, options ...Opti
 //
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight goroutines are not interrupted.
+// Use [ForEachMapCtx] when fn needs to observe cancellation.
 //
 // Example:
 //
@@ -341,6 +488,26 @@ func ForEachMap[K comparable, V any](in map[K]V, fn func(K, V), options ...Optio
 			}
 		}
 	}, func(p kvPair[K, V]) { fn(p.k, p.v) }, options...)
+}
+
+// MapMapCtx is [MapMap] with a context passed into each fn call. The context
+// is cancelled on the same conditions as [MapSeqCtx]: when the [WithContext]
+// context is cancelled or any fn call panics.
+func MapMapCtx[K comparable, V, R any](in map[K]V, fn func(context.Context, K, V) R, options ...Option) []R {
+	return slices.Collect(MapSeq2Ctx(maps.All(in), fn, options...))
+}
+
+// ForEachMapCtx is [ForEachMap] with a context passed into each fn call. The
+// context is cancelled on the same conditions as [ForEachSeqCtx]: when the
+// [WithContext] context is cancelled or any fn call panics.
+func ForEachMapCtx[K comparable, V any](in map[K]V, fn func(context.Context, K, V), options ...Option) {
+	ForEachSeqCtx(func(yield func(kvPair[K, V]) bool) {
+		for k, v := range in {
+			if !yield(kvPair[K, V]{k, v}) {
+				return
+			}
+		}
+	}, func(ctx context.Context, p kvPair[K, V]) { fn(ctx, p.k, p.v) }, options...)
 }
 
 // MapSeqErr concurrently maps in using fn, passing a derived context into each
@@ -549,17 +716,37 @@ outer:
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight mapping goroutines are not interrupted. The
 // result then holds only the results of dispatched elements, in order.
+// Use [MapCtx] when fn needs to observe cancellation.
 //
 // Example:
 //
 //	doubled := iter.Map(nums, func(n int) int { return n * 2 })
 func Map[T, R any](in []T, fn func(T) R, options ...Option) []R {
+	return collectN(len(in), MapSeq(slices.Values(in), fn, options...))
+}
+
+// MapCtx is [Map] with a context passed into each fn call. The context is
+// cancelled on the same conditions as [MapSeqCtx]: when the [WithContext]
+// context is cancelled or any fn call panics. Allocation and truncation
+// behave as for Map.
+//
+// Example:
+//
+//	pages := iter.MapCtx(urls, func(ctx context.Context, url string) []byte {
+//	    return fetch(ctx, url)
+//	}, iter.WithContext(ctx), iter.WithMaxGoroutines(8))
+func MapCtx[T, R any](in []T, fn func(context.Context, T) R, options ...Option) []R {
+	return collectN(len(in), MapSeqCtx(slices.Values(in), fn, options...))
+}
+
+// collectN collects seq into a slice with capacity n. The slice is allocated
+// on the first element, not up front, so a context cancelled before any
+// dispatch costs nothing; collectN returns nil if seq yields nothing.
+func collectN[R any](n int, seq stditer.Seq[R]) []R {
 	var out []R
-	for r := range MapSeq(slices.Values(in), fn, options...) {
+	for r := range seq {
 		if out == nil {
-			// Allocate on the first result, not up front, so a context
-			// cancelled before any dispatch costs nothing.
-			out = make([]R, 0, len(in))
+			out = make([]R, 0, n)
 		}
 		out = append(out, r)
 	}
@@ -593,6 +780,7 @@ func MapErr[T, R any](in []T, fn func(context.Context, T) (R, error), options ..
 // Cancelling the context provided via [WithContext] stops new elements from
 // being dispatched; in-flight goroutines are not interrupted. Elements not yet
 // dispatched are skipped.
+// Use [ForEachCtx] when fn needs to observe cancellation.
 //
 // Example:
 //
@@ -601,6 +789,19 @@ func MapErr[T, R any](in []T, fn func(context.Context, T) (R, error), options ..
 //	}, iter.WithMaxGoroutines(8))
 func ForEach[T any](in []T, fn func(T), options ...Option) {
 	ForEachSeq(slices.Values(in), fn, options...)
+}
+
+// ForEachCtx is [ForEach] with a context passed into each fn call. The
+// context is cancelled on the same conditions as [ForEachSeqCtx]: when the
+// [WithContext] context is cancelled or any fn call panics.
+//
+// Example:
+//
+//	iter.ForEachCtx(items, func(ctx context.Context, item Item) {
+//	    process(ctx, item)
+//	}, iter.WithContext(ctx), iter.WithMaxGoroutines(8))
+func ForEachCtx[T any](in []T, fn func(context.Context, T), options ...Option) {
+	ForEachSeqCtx(slices.Values(in), fn, options...)
 }
 
 // ForEachErr concurrently calls fn for each element in in, passing a derived

@@ -635,6 +635,11 @@ func TestMapSeqErr_WithCancelOnError_CancelsInflightWork(t *testing.T) {
 		in := slices.Values([]int{1, 2})
 		_, err := conkiter.MapSeqErr(in, func(ctx context.Context, v int) (int, error) {
 			if v == 1 {
+				// Fake time only advances once every goroutine is blocked, so
+				// v=2 is guaranteed to be dispatched and waiting before v=1
+				// errors. Without this, v=1 could error first and
+				// WithCancelOnError would correctly never dispatch v=2.
+				time.Sleep(time.Second)
 				return 0, errors.New("deliberate error")
 			}
 			<-ctx.Done()
@@ -754,6 +759,9 @@ func TestForEachSeqErr_WithCancelOnError_CancelsInflightWork(t *testing.T) {
 		in := slices.Values([]int{1, 2})
 		err := conkiter.ForEachSeqErr(in, func(ctx context.Context, v int) error {
 			if v == 1 {
+				// See TestMapSeqErr_WithCancelOnError_CancelsInflightWork: the
+				// fake-time sleep guarantees v=2 is in flight before v=1 errors.
+				time.Sleep(time.Second)
 				return errors.New("deliberate error")
 			}
 			<-ctx.Done()
@@ -1012,5 +1020,255 @@ func TestForEachErr_WithCancelOnError_LimitsDispatch(t *testing.T) {
 
 		assert.LessOrEqual(t, dispatched.Load(), int64(maxWorkers),
 			"WithCancelOnError must stop dispatch beyond the initial in-flight batch")
+	})
+}
+
+// awaitCancel blocks until ctx is cancelled, reporting true, or until an hour
+// of fake time passes without cancellation, reporting false.
+func awaitCancel(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	case <-time.After(time.Hour):
+		return false
+	}
+}
+
+type ctxKey struct{}
+
+func TestMapSeqCtx_FnReceivesGoverningContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ctxKey{}, "governing")
+
+	out := slices.Collect(conkiter.MapSeqCtx(slices.Values([]int{1, 2}), func(ctx context.Context, _ int) string {
+		v, _ := ctx.Value(ctxKey{}).(string)
+		return v
+	}, conkiter.WithContext(ctx)))
+
+	assert.Equal(t, []string{"governing", "governing"}, out)
+}
+
+func TestMapSeqCtx_PreservesSubmissionOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		delays := []time.Duration{3 * time.Second, 1 * time.Second, 2 * time.Second}
+
+		out := slices.Collect(conkiter.MapSeqCtx(slices.Values(delays), func(_ context.Context, d time.Duration) time.Duration {
+			time.Sleep(d)
+			return d
+		}))
+
+		assert.Equal(t, delays, out)
+	})
+}
+
+func TestMapSeqCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+
+		out := slices.Collect(conkiter.MapSeqCtx(slices.Values([]int{1, 2}), func(ctx context.Context, _ int) bool {
+			return awaitCancel(ctx)
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2)))
+
+		assert.Equal(t, []bool{true, true}, out, "cancelling the governing context must reach in-flight fn calls")
+	})
+}
+
+func TestMapSeqCtx_EarlyBreakCancelsInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var sawCancel atomic.Bool
+		start := time.Now()
+
+		for range conkiter.MapSeqCtx(slices.Values([]int{1, 2}), func(ctx context.Context, v int) int {
+			if v == 1 {
+				// v=2 is dispatched and waiting before v=1 is yielded.
+				time.Sleep(time.Second)
+				return v
+			}
+			sawCancel.Store(awaitCancel(ctx))
+			return v
+		}, conkiter.WithMaxGoroutines(2)) {
+			break
+		}
+
+		assert.True(t, sawCancel.Load(), "breaking out of the range must cancel in-flight fn calls")
+		assert.Equal(t, time.Second, time.Since(start), "the range must not wait for in-flight work to finish naturally")
+	})
+}
+
+func TestMapSeqCtx_PanicCancelsInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var sawCancel atomic.Bool
+
+		v := func() (val any) {
+			defer func() { val = recover() }()
+			_ = slices.Collect(conkiter.MapSeqCtx(slices.Values([]int{1, 2}), func(ctx context.Context, v int) int {
+				if v == 1 {
+					time.Sleep(time.Second)
+					panic("boom")
+				}
+				sawCancel.Store(awaitCancel(ctx))
+				return v
+			}, conkiter.WithMaxGoroutines(2)))
+			return nil
+		}()
+
+		r, ok := v.(*panics.Recovered)
+		require.True(t, ok, "MapSeqCtx must re-panic with *panics.Recovered, got %T", v)
+		assert.Equal(t, "boom", r.Value)
+		assert.True(t, sawCancel.Load(), "a panic in fn must cancel sibling fn contexts")
+	})
+}
+
+func TestMapSeq2Ctx_FnReceivesContextKeyAndValue(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ctxKey{}, "governing")
+	pairs := stditer.Seq2[int, string](func(yield func(int, string) bool) {
+		_ = yield(1, "a") && yield(2, "b")
+	})
+
+	out := slices.Collect(conkiter.MapSeq2Ctx(pairs, func(ctx context.Context, k int, v string) string {
+		g, _ := ctx.Value(ctxKey{}).(string)
+		return fmt.Sprintf("%s:%d=%s", g, k, v)
+	}, conkiter.WithContext(ctx)))
+
+	assert.Equal(t, []string{"governing:1=a", "governing:2=b"}, out)
+}
+
+func TestMapSeq2Ctx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+		pairs := stditer.Seq2[int, int](func(yield func(int, int) bool) {
+			_ = yield(1, 1) && yield(2, 2)
+		})
+
+		out := slices.Collect(conkiter.MapSeq2Ctx(pairs, func(ctx context.Context, _, _ int) bool {
+			return awaitCancel(ctx)
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2)))
+
+		assert.Equal(t, []bool{true, true}, out)
+	})
+}
+
+func TestForEachSeqCtx_FnReceivesGoverningContext(t *testing.T) {
+	ctx := context.WithValue(context.Background(), ctxKey{}, "governing")
+
+	var matched atomic.Int64
+	conkiter.ForEachSeqCtx(slices.Values([]int{1, 2, 3}), func(ctx context.Context, _ int) {
+		if ctx.Value(ctxKey{}) == "governing" {
+			matched.Add(1)
+		}
+	}, conkiter.WithContext(ctx))
+
+	assert.Equal(t, int64(3), matched.Load())
+}
+
+func TestForEachSeqCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+
+		var observed atomic.Int64
+		conkiter.ForEachSeqCtx(slices.Values([]int{1, 2}), func(ctx context.Context, _ int) {
+			if awaitCancel(ctx) {
+				observed.Add(1)
+			}
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2))
+
+		assert.Equal(t, int64(2), observed.Load(), "cancelling the governing context must reach in-flight fn calls")
+	})
+}
+
+func TestForEachSeqCtx_PanicCancelsInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var sawCancel atomic.Bool
+
+		v := func() (val any) {
+			defer func() { val = recover() }()
+			conkiter.ForEachSeqCtx(slices.Values([]int{1, 2}), func(ctx context.Context, v int) {
+				if v == 1 {
+					time.Sleep(time.Second)
+					panic("boom")
+				}
+				sawCancel.Store(awaitCancel(ctx))
+			}, conkiter.WithMaxGoroutines(2))
+			return nil
+		}()
+
+		r, ok := v.(*panics.Recovered)
+		require.True(t, ok, "ForEachSeqCtx must re-panic with *panics.Recovered, got %T", v)
+		assert.Equal(t, "boom", r.Value)
+		assert.True(t, sawCancel.Load(), "a panic in fn must cancel sibling fn contexts")
+	})
+}
+
+func TestMapMapCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+
+		out := conkiter.MapMapCtx(map[string]int{"a": 1, "b": 2}, func(ctx context.Context, _ string, _ int) bool {
+			return awaitCancel(ctx)
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2))
+
+		assert.Equal(t, []bool{true, true}, out)
+	})
+}
+
+func TestForEachMapCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+
+		var observed atomic.Int64
+		conkiter.ForEachMapCtx(map[string]int{"a": 1, "b": 2}, func(ctx context.Context, _ string, _ int) {
+			if awaitCancel(ctx) {
+				observed.Add(1)
+			}
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2))
+
+		assert.Equal(t, int64(2), observed.Load())
+	})
+}
+
+func TestMapCtx_PreservesOrderAndReceivesContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.WithValue(context.Background(), ctxKey{}, "g")
+		delays := []time.Duration{3 * time.Second, 1 * time.Second, 2 * time.Second}
+
+		out := conkiter.MapCtx(delays, func(ctx context.Context, d time.Duration) string {
+			time.Sleep(d)
+			return fmt.Sprintf("%s:%s", ctx.Value(ctxKey{}), d)
+		}, conkiter.WithContext(ctx))
+
+		assert.Equal(t, []string{"g:3s", "g:1s", "g:2s"}, out)
+	})
+}
+
+func TestMapCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+
+		out := conkiter.MapCtx([]int{1, 2}, func(ctx context.Context, _ int) bool {
+			return awaitCancel(ctx)
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2))
+
+		assert.Equal(t, []bool{true, true}, out)
+	})
+}
+
+func TestForEachCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		time.AfterFunc(time.Second, cancel)
+
+		var observed atomic.Int64
+		conkiter.ForEachCtx([]int{1, 2}, func(ctx context.Context, _ int) {
+			if awaitCancel(ctx) {
+				observed.Add(1)
+			}
+		}, conkiter.WithContext(ctx), conkiter.WithMaxGoroutines(2))
+
+		assert.Equal(t, int64(2), observed.Load())
 	})
 }
