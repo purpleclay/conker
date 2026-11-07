@@ -19,7 +19,7 @@ func workerCounts() []int {
 	return []int{1, n, 2 * n}
 }
 
-var noopProducer = func(_ context.Context) stream.Callback { return nil }
+var noopProducer = func(_ context.Context) (stream.Callback, error) { return nil, nil }
 
 // BenchmarkStream_Go measures the cost of submitting and completing a fixed
 // batch of no-op producers across three concurrency levels. Neither the
@@ -34,7 +34,7 @@ func BenchmarkStream_Go(b *testing.B) {
 				for range benchTasks {
 					s.Go(noopProducer)
 				}
-				s.Wait()
+				_ = s.Wait()
 			}
 		})
 	}

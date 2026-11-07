@@ -262,14 +262,14 @@ for _, r := range results {
 ```go
 s := stream.New()
 for _, item := range items {
-    s.Go(func(ctx context.Context) stream.Callback {
+    s.Go(func(ctx context.Context) (stream.Callback, error) {
         result := process(ctx, item) // concurrent
         return func() {
             emit(result) // ordered, fires when this slot's turn arrives
-        }
+        }, nil
     })
 }
-s.Wait()
+err := s.Wait()
 ```
 
 </td>
