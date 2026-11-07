@@ -350,6 +350,9 @@ func (p *Pool) runTask(fn func(context.Context) error) {
 // all task errors, or only the first with [Pool.WithFirstError]. Panics from
 // tasks are captured and returned as *[panics.Recovered] errors rather than
 // crashing the process.
+//
+// Errors are joined in completion order, the same order as [Pool.Errors].
+// Pool does not track submission order; use [ResultPool] when it matters.
 func (p *Pool) Wait() error {
 	p.wg.Wait()
 	p.cancel(nil)
@@ -376,9 +379,9 @@ func (p *Pool) Reset() {
 	p.ctx, p.cancel = context.WithCancelCause(p.parentCtx)
 }
 
-// Errors returns a slice of all errors collected from tasks. This provides
-// access to the raw error slice for callers needing per-error filtering with
-// [errors.As]. Returns nil if no errors occurred.
+// Errors returns a slice of all errors collected from tasks, in completion
+// order. This provides access to the raw error slice for callers needing
+// per-error filtering with [errors.As]. Returns nil if no errors occurred.
 //
 // Example — filtering errors by type:
 //
@@ -426,12 +429,16 @@ type indexedResult[T any] struct {
 //	}
 //	results, err := p.Wait()
 type ResultPool[T any] struct {
-	pool    *Pool
-	idx     atomic.Int64
-	mu      sync.Mutex
-	results []indexedResult[T]
-	ordered bool
-	capHint int
+	pool *Pool
+	idx  atomic.Int64
+
+	// mu guards results and firstErr. results is the only store of task
+	// errors; firstErr is the first one recorded, in completion order.
+	mu       sync.Mutex
+	results  []indexedResult[T]
+	firstErr error
+	ordered  bool
+	capHint  int
 }
 
 // NewWithResults returns a ResultPool with submission-order results and a
@@ -531,6 +538,11 @@ func (p *ResultPool[T]) TryGo(fn func(context.Context) (T, error)) bool {
 // result, even on error or panic. An index claimed by a submission that is
 // then rejected is never recorded; the gap is harmless because results are
 // only sorted by relative index.
+//
+// The wrapper always returns nil to the inner pool, so each error is stored
+// once, in results. Cancellation on error happens here instead, under the
+// same lock that records firstErr, so the cancellation cause always matches
+// the error WithFirstError returns.
 func (p *ResultPool[T]) task(fn func(context.Context) (T, error)) func(context.Context) error {
 	idx := p.idx.Add(1) - 1
 	return func(taskCtx context.Context) error {
@@ -547,8 +559,14 @@ func (p *ResultPool[T]) task(fn func(context.Context) (T, error)) func(context.C
 		}
 		p.mu.Lock()
 		p.results = append(p.results, indexedResult[T]{idx: idx, val: val, err: err})
+		if err != nil && p.firstErr == nil {
+			p.firstErr = err
+			if p.pool.cancelOnError {
+				p.pool.cancel(err)
+			}
+		}
 		p.mu.Unlock()
-		return err
+		return nil
 	}
 }
 
@@ -556,10 +574,13 @@ func (p *ResultPool[T]) task(fn func(context.Context) (T, error)) func(context.C
 // alongside [errors.Join] of all task errors. Results from errored tasks are
 // included — no result is silently dropped.
 //
-// By default results are sorted into submission order before returning.
-// With [ResultPool.WithUnorderedResults] they are returned in completion order.
+// By default results and errors are sorted into submission order before
+// returning. With [ResultPool.WithUnorderedResults] both are in completion
+// order. Either way, the joined errors are in the same order as
+// [ResultPool.Errors]. With [ResultPool.WithFirstError], Wait returns only
+// the first error recorded, which is the first to complete.
 func (p *ResultPool[T]) Wait() ([]T, error) {
-	err := p.pool.Wait()
+	_ = p.pool.Wait() // always nil: task errors are recorded in p.results
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -571,10 +592,17 @@ func (p *ResultPool[T]) Wait() ([]T, error) {
 	}
 
 	out := make([]T, len(p.results))
+	var errs []error
 	for i, r := range p.results {
 		out[i] = r.val
+		if r.err != nil {
+			errs = append(errs, r.err)
+		}
 	}
-	return out, err
+	if p.pool.firstError && p.firstErr != nil {
+		return out, p.firstErr
+	}
+	return out, errors.Join(errs...)
 }
 
 // Reset clears all collected results and errors, reinitialises the submission
@@ -597,6 +625,7 @@ func (p *ResultPool[T]) Reset() {
 	} else {
 		p.results = nil
 	}
+	p.firstErr = nil
 	p.mu.Unlock()
 	p.idx.Store(0)
 	p.pool.Reset()
