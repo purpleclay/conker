@@ -4,12 +4,16 @@
 //
 // Create a Stream with [New] and submit producers with [Stream.Go]. Call
 // [Stream.Wait] to block until all producers have finished and all callbacks
-// have run. Panics in either producers or callbacks propagate through Wait as
-// *[panics.Recovered] values.
+// have run. Call [Stream.Reset] to reuse the Stream for another batch.
 //
-// Panic semantics differ from pool: a panic in any producer or callback halts
-// the dispatcher immediately and all pending callbacks are dropped. Because
-// callbacks must execute in submission order, skipping a failed slot and
-// resuming the sequence is not possible — halting is the only coherent
-// response.
+// Producers fail by returning an error. The failed producer's callback is
+// skipped, the remaining callbacks still run in order, and Wait returns the
+// errors joined in submission order. [Stream.WithCancelOnError] cancels the
+// remaining producers on the first error, and [Stream.WithContext] ties the
+// stream to a caller's context.
+//
+// Panics are handled differently: a panic in any producer or callback halts
+// the dispatcher immediately, all pending callbacks are dropped, and Wait
+// re-panics with a *[panics.Recovered]. A panic leaves no sensible slot to
+// resume from, so halting is the only coherent response.
 package stream

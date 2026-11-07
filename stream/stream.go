@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -15,6 +16,7 @@ type Callback func()
 
 type callbackOrPanic struct {
 	cb    Callback
+	err   error
 	panic *panics.Recovered
 }
 
@@ -27,34 +29,46 @@ type callbackOrPanic struct {
 // in the order their producers were submitted, regardless of when the producers
 // finish.
 //
-// Stream is single-shot: [Stream.Wait] is terminal, and [Stream.Go] /
-// [Stream.GoCtx] panic if called after Wait has been called. Unlike
-// [pool.Pool], callbacks must not submit further work — Stream has no
-// recursive submission support. Use [pool.Pool] for workloads where tasks
-// need to submit child tasks.
+// A producer that returns a non-nil error has its callback skipped; the
+// remaining callbacks still run in order and [Stream.Wait] returns the joined
+// errors. A panic is different: it halts the dispatcher and is re-panicked
+// from Wait.
+//
+// [Stream.Wait] ends a batch: [Stream.Go] / [Stream.GoCtx] panic if called
+// after it until [Stream.Reset] is called. Unlike [pool.Pool], callbacks must
+// not submit further work — Stream has no recursive submission support. Use
+// [pool.Pool] for workloads where tasks need to submit child tasks.
 //
 // Example:
 //
 //	s := stream.New().WithMaxGoroutines(4)
 //	for _, item := range items {
-//	    s.Go(func(ctx context.Context) stream.Callback {
-//	        result := process(ctx, item)  // runs concurrently
+//	    s.Go(func(ctx context.Context) (stream.Callback, error) {
+//	        result, err := process(ctx, item)  // runs concurrently
+//	        if err != nil {
+//	            return nil, err
+//	        }
 //	        return func() {
 //	            emit(result)  // runs in submission order
-//	        }
+//	        }, nil
 //	    })
 //	}
-//	s.Wait()
+//	err := s.Wait()
 type Stream struct {
-	sem    chan struct{}
-	ctx    context.Context
-	cancel context.CancelCauseFunc
+	sem       chan struct{}
+	parentCtx context.Context
+	ctx       context.Context
+	cancel    context.CancelCauseFunc
 
 	// submitted carries per-producer result channels in submission order.
 	// The dispatcher reads them in order and blocks on each until the producer
 	// writes its result.
 	submitted    chan chan callbackOrPanic
 	dispatchDone chan struct{}
+
+	// errs is written only by the dispatcher, in submission order, and read by
+	// Wait after dispatchDone is closed.
+	errs []error
 
 	// dispatchPC catches panics originating in callbacks. Producer panics are
 	// stored directly in producerPanic to preserve the original stack without
@@ -74,22 +88,26 @@ type Stream struct {
 	// the waited flip in Wait, so no GoCtx call can be admitted afterwards.
 	submitWg sync.WaitGroup
 
-	// cfgMu guards sem, started, and waited, preventing reconfiguration after
-	// the first Go call and making repeated Wait calls a no-op.
-	cfgMu   sync.Mutex
-	started bool
-	waited  bool
+	// cfgMu guards sem, parentCtx, ctx, cancelOnError, started, and waited,
+	// preventing reconfiguration after the first Go call and making repeated
+	// Wait calls a no-op.
+	cfgMu         sync.Mutex
+	started       bool
+	waited        bool
+	cancelOnError bool
 
 	once sync.Once
 }
 
 // New returns a Stream with a default concurrency of [runtime.GOMAXPROCS](0).
 func New() *Stream {
-	ctx, cancel := context.WithCancelCause(context.Background())
+	parentCtx := context.Background()
+	ctx, cancel := context.WithCancelCause(parentCtx)
 	return &Stream{
-		sem:    make(chan struct{}, runtime.GOMAXPROCS(0)),
-		ctx:    ctx,
-		cancel: cancel,
+		sem:       make(chan struct{}, runtime.GOMAXPROCS(0)),
+		parentCtx: parentCtx,
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 }
 
@@ -109,6 +127,57 @@ func (s *Stream) WithMaxGoroutines(n int) *Stream {
 	return s
 }
 
+// WithContext sets the parent context for the stream. The context passed to
+// every producer is derived from ctx, so cancelling ctx cancels in-flight and
+// future producers. It does not affect ctx itself.
+//
+// Cancellation does not stop [Stream.Go] from accepting producers; they start
+// with an already-cancelled context and should return promptly.
+//
+// It panics if ctx is nil or if called after the first [Stream.Go].
+//
+// Example:
+//
+//	s := stream.New().WithContext(ctx) // ctx is the caller's request context
+//	s.Go(func(ctx context.Context) (stream.Callback, error) {
+//	    return fetch(ctx) // cancelled if the request is cancelled
+//	})
+func (s *Stream) WithContext(ctx context.Context) *Stream {
+	if ctx == nil {
+		panic("stream: WithContext requires non-nil context")
+	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.started {
+		panic("stream: WithContext must be called before Go")
+	}
+	s.cancel(nil)
+	s.parentCtx = ctx
+	s.ctx, s.cancel = context.WithCancelCause(ctx)
+	return s
+}
+
+// WithCancelOnError cancels the context passed to every producer as soon as
+// any producer returns a non-nil error or panics. The triggering error (or
+// *[panics.Recovered]) is set as the cancellation cause, which producers can
+// read with [context.Cause]. If the context was already cancelled, for example
+// by a parent supplied via [Stream.WithContext], the existing cause is kept.
+//
+// Callbacks are not cancelled: those whose producers succeeded still run in
+// submission order, and every producer error is still returned from
+// [Stream.Wait].
+//
+// It panics if called after the first [Stream.Go].
+func (s *Stream) WithCancelOnError() *Stream {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	if s.started {
+		panic("stream: WithCancelOnError must be called before Go")
+	}
+	s.cancelOnError = true
+	return s
+}
+
 func (s *Stream) start() {
 	s.submitted = make(chan chan callbackOrPanic, cap(s.sem))
 	s.dispatchDone = make(chan struct{})
@@ -123,6 +192,11 @@ func (s *Stream) start() {
 					// lose the original panic site in the stack trace.
 					s.producerPanic.CompareAndSwap(nil, cop.panic)
 					return
+				}
+				if cop.err != nil {
+					// Unlike a panic, an error skips only its own slot.
+					s.errs = append(s.errs, cop.err)
+					continue
 				}
 				if cop.cb != nil {
 					cop.cb()
@@ -154,9 +228,9 @@ func (s *Stream) start() {
 // backpressure.
 //
 // GoCtx panics if called on a zero-value Stream, or if called after
-// [Stream.Wait] — Stream is single-shot; use [New] for a fresh one, or
-// [pool.Pool] for workloads where tasks submit further work.
-func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) error {
+// [Stream.Wait] without an intervening [Stream.Reset]. Use [pool.Pool] for
+// workloads where tasks submit further work.
+func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) (Callback, error)) error {
 	s.cfgMu.Lock()
 	if s.sem == nil {
 		s.cfgMu.Unlock()
@@ -164,10 +238,11 @@ func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) e
 	}
 	if s.waited {
 		s.cfgMu.Unlock()
-		panic("stream: Go called after Wait — Stream is single-shot")
+		panic("stream: Go called after Wait — call Reset to reuse the Stream")
 	}
 	s.started = true
 	s.submitWg.Add(1)
+	producerCtx, cancelOnError := s.ctx, s.cancelOnError
 	s.cfgMu.Unlock()
 	defer s.submitWg.Done()
 
@@ -188,14 +263,20 @@ func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) e
 		defer func() { <-s.sem }()
 
 		var pc panics.Catcher
-		var cb Callback
-		pc.Try(func() { cb = fn(s.ctx) })
+		var cop callbackOrPanic
+		pc.Try(func() { cop.cb, cop.err = fn(producerCtx) })
 
 		if r := pc.Recovered(); r != nil {
-			slot <- callbackOrPanic{panic: r}
-		} else {
-			slot <- callbackOrPanic{cb: cb}
+			cop = callbackOrPanic{panic: r}
 		}
+		if cancelOnError {
+			if cop.panic != nil {
+				s.cancel(cop.panic)
+			} else if cop.err != nil {
+				s.cancel(cop.err)
+			}
+		}
+		slot <- cop
 	}()
 	return nil
 }
@@ -204,33 +285,35 @@ func (s *Stream) GoCtx(ctx context.Context, fn func(context.Context) Callback) e
 // The producer receives the stream's internal context.
 //
 // Go panics if called on a zero-value Stream, or if called after
-// [Stream.Wait] — Stream is single-shot; use [New] for a fresh one, or
-// [pool.Pool] for workloads where tasks submit further work.
-func (s *Stream) Go(fn func(context.Context) Callback) {
-	_ = s.GoCtx(s.ctx, fn)
+// [Stream.Wait] without an intervening [Stream.Reset]. Use [pool.Pool] for
+// workloads where tasks submit further work.
+func (s *Stream) Go(fn func(context.Context) (Callback, error)) {
+	// context.Background(), not the stream's context: Go blocks until a slot
+	// is free and never bails out, even once the stream has been cancelled.
+	_ = s.GoCtx(context.Background(), fn)
 }
 
 // Wait blocks until all producers have finished and all callbacks have run in
-// submission order. Panics from producers or callbacks are captured and
-// re-panicked as *[panics.Recovered] values.
+// submission order. It returns [errors.Join] of every producer error, in
+// submission order, or nil if none failed.
 //
-// A panic in any producer or callback halts the dispatcher immediately. All
-// pending callbacks — including those from producers that have already
-// completed — are silently dropped. This differs from [pool.Pool], which
-// collects every error and continues. The difference is intentional: because
-// callbacks must fire in submission order, there is no meaningful way to skip
-// a failed slot and resume the sequence.
+// Errors and panics are handled differently. A producer error skips only that
+// producer's callback; the remaining callbacks still run in order. A panic in
+// any producer or callback halts the dispatcher immediately, all pending
+// callbacks are dropped, and Wait re-panics with a *[panics.Recovered]. A
+// panic has no sensible slot to resume from, so halting is the only coherent
+// response.
 //
-// Wait is terminal: once it returns, the Stream is done and [Stream.Go] /
-// [Stream.GoCtx] panic on any further call, including one made from a
-// callback. Stream has no recursive submission support — use [pool.Pool] for
-// workloads where tasks need to submit child tasks. A second call to Wait is
-// a no-op. Wait is also a no-op when no tasks have been submitted.
-func (s *Stream) Wait() {
+// Once Wait returns, [Stream.Go] / [Stream.GoCtx] panic on any further call,
+// including one made from a callback, until [Stream.Reset] is called. Stream
+// has no recursive submission support — use [pool.Pool] for workloads where
+// tasks need to submit child tasks. A second call to Wait is a no-op that
+// returns nil. Wait is also a no-op when no tasks have been submitted.
+func (s *Stream) Wait() error {
 	s.cfgMu.Lock()
 	if s.waited {
 		s.cfgMu.Unlock()
-		return
+		return nil
 	}
 	s.waited = true
 	s.cfgMu.Unlock()
@@ -243,7 +326,7 @@ func (s *Stream) Wait() {
 
 	if s.submitted == nil {
 		s.cancel(nil)
-		return
+		return nil
 	}
 	close(s.submitted)
 	<-s.dispatchDone
@@ -254,4 +337,26 @@ func (s *Stream) Wait() {
 		panic(r)
 	}
 	s.dispatchPC.Repanic()
+	return errors.Join(s.errs...)
+}
+
+// Reset prepares the stream for another batch of producers after
+// [Stream.Wait] has returned or panicked. It clears collected errors and
+// captured panics and derives a fresh context from the parent. Configuration
+// set via [Stream.WithMaxGoroutines], [Stream.WithContext], and
+// [Stream.WithCancelOnError] is preserved.
+//
+// Reset must not be called concurrently with [Stream.Go], [Stream.GoCtx], or
+// [Stream.Wait].
+func (s *Stream) Reset() {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	s.submitted = nil
+	s.dispatchDone = nil
+	s.errs = nil
+	s.dispatchPC = panics.Catcher{}
+	s.producerPanic.Store(nil)
+	s.ctx, s.cancel = context.WithCancelCause(s.parentCtx)
+	s.waited = false
+	s.once = sync.Once{}
 }

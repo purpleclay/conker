@@ -92,7 +92,7 @@ func main() {
 		status := statuses[rand.IntN(len(statuses))]
 		idx := i
 
-		if err := s.GoCtx(ctx, func(taskCtx context.Context) stream.Callback {
+		if err := s.GoCtx(ctx, func(taskCtx context.Context) (stream.Callback, error) {
 			// Enrichment runs concurrently — completions arrive out of order.
 			entry := enrich(taskCtx, resolver, ep.method, ep.path, status, ip)
 			slog.Info(
@@ -104,7 +104,7 @@ func main() {
 				"latency", entry.Latency.Round(time.Millisecond),
 			)
 			// Callback runs serially in submission order.
-			return func() { entries = append(entries, entry) }
+			return func() { entries = append(entries, entry) }, nil
 		}); err != nil {
 			slog.Info("processing stopped", "submitted", submitted, "reason", err)
 			break
@@ -112,7 +112,7 @@ func main() {
 		submitted++
 	}
 
-	s.Wait()
+	_ = s.Wait() // enrich never fails, so there are no producer errors to report
 	printSummary(entries, submitted)
 }
 
