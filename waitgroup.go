@@ -11,8 +11,8 @@ import (
 // [WaitGroup.Wait] or [WaitGroup.WaitAndRecover].
 //
 // The zero value is ready to use. WaitGroup is reusable across multiple
-// Wait cycles when no panic occurs. If a goroutine panics, create a new
-// WaitGroup for subsequent work rather than reusing the same instance.
+// Wait cycles. After a goroutine panics, call [WaitGroup.Reset] before reusing
+// it, or the next cycle reports the old panic.
 //
 // Example — basic usage:
 //
@@ -53,4 +53,12 @@ func (w *WaitGroup) Wait() {
 func (w *WaitGroup) WaitAndRecover() *panics.Recovered {
 	w.wg.Wait()
 	return w.pc.Recovered()
+}
+
+// Reset clears any captured panic so the WaitGroup can be reused after a
+// goroutine panicked. Call it only after [WaitGroup.Wait] or
+// [WaitGroup.WaitAndRecover] has returned, never concurrently with
+// [WaitGroup.Go].
+func (w *WaitGroup) Reset() {
+	w.pc.Reset()
 }

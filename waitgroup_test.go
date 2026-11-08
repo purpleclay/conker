@@ -113,7 +113,7 @@ func TestWaitGroup_ReuseAfterPanic_AlwaysReturnsStalePanic(t *testing.T) {
 	r2 := wg.WaitAndRecover()
 
 	require.NotNil(t, r2)
-	assert.Equal(t, first, r2.Value, "stale first panic returned — create a new WaitGroup after a panic")
+	assert.Equal(t, first, r2.Value, "stale first panic returned — call Reset after a panic")
 }
 
 func TestWaitGroup_Reusable(t *testing.T) {
@@ -129,4 +129,20 @@ func TestWaitGroup_Reusable(t *testing.T) {
 	wg.Go(func() { result = 2 })
 	wg.Wait()
 	assert.Equal(t, 2, result)
+}
+
+func TestWaitGroup_Reset_AllowsReuseAfterPanic(t *testing.T) {
+	var wg conker.WaitGroup
+
+	wg.Go(func() { panic("first") })
+	require.NotNil(t, wg.WaitAndRecover())
+
+	wg.Reset()
+	wg.Go(func() {})
+	assert.Nil(t, wg.WaitAndRecover(), "Reset must clear the previous cycle's panic")
+
+	wg.Go(func() { panic("second") })
+	r := wg.WaitAndRecover()
+	require.NotNil(t, r)
+	assert.Equal(t, "second", r.Value)
 }

@@ -1188,3 +1188,44 @@ func TestResultPool_Reset_ClearsFirstErrorAfterFailedBatch(t *testing.T) {
 		assert.Same(t, errNew, cause, "the new batch's first failure must be the cancellation cause")
 	})
 }
+
+func TestPool_Wait_CancelsWithErrPoolClosed(t *testing.T) {
+	p := pool.New()
+
+	var taskCtx context.Context
+	p.Go(func(ctx context.Context) error {
+		taskCtx = ctx
+		return nil
+	})
+
+	require.NoError(t, p.Wait())
+	assert.ErrorIs(t, context.Cause(taskCtx), pool.ErrPoolClosed)
+}
+
+func TestResultPool_Wait_CancelsWithErrPoolClosed(t *testing.T) {
+	p := pool.NewWithResults[int]()
+
+	var taskCtx context.Context
+	p.Go(func(ctx context.Context) (int, error) {
+		taskCtx = ctx
+		return 0, nil
+	})
+
+	_, err := p.Wait()
+	require.NoError(t, err)
+	assert.ErrorIs(t, context.Cause(taskCtx), pool.ErrPoolClosed)
+}
+
+func TestPool_Wait_KeepsEarlierCancellationCause(t *testing.T) {
+	p := pool.New().WithCancelOnError()
+	sentinel := errors.New("task failed")
+
+	var taskCtx context.Context
+	p.Go(func(ctx context.Context) error {
+		taskCtx = ctx
+		return sentinel
+	})
+
+	require.ErrorIs(t, p.Wait(), sentinel)
+	assert.Same(t, sentinel, context.Cause(taskCtx), "Wait must not overwrite the cause set by WithCancelOnError")
+}
