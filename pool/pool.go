@@ -13,6 +13,17 @@ import (
 	"github.com/purpleclay/conker/panics"
 )
 
+// ErrPoolClosed is the cancellation cause set on a pool's context when
+// [Pool.Wait] or [ResultPool.Wait] returns. Tasks that keep their context can
+// tell a finished pool apart from a cancelled parent with
+// errors.Is(context.Cause(ctx), ErrPoolClosed).
+//
+// The check only works for a task context that was still live when Wait
+// returned. With [Pool.WithTaskTimeout], each task's context is cancelled as
+// soon as the task returns, so its cause is [context.Canceled] (or
+// [context.DeadlineExceeded] if the timeout fired), never ErrPoolClosed.
+var ErrPoolClosed = errors.New("pool: closed")
+
 // Pool is a bounded, panic-safe task runner. Create one with [New]; the zero
 // value is not usable.
 //
@@ -351,11 +362,15 @@ func (p *Pool) runTask(fn func(context.Context) error) {
 // tasks are captured and returned as *[panics.Recovered] errors rather than
 // crashing the process.
 //
+// Wait cancels the pool's context with [ErrPoolClosed] as the cause, unless
+// it was already cancelled, for example by [Pool.WithCancelOnError] or a
+// parent context, in which case the earlier cause is kept.
+//
 // Errors are joined in completion order, the same order as [Pool.Errors].
 // Pool does not track submission order; use [ResultPool] when it matters.
 func (p *Pool) Wait() error {
 	p.wg.Wait()
-	p.cancel(nil)
+	p.cancel(ErrPoolClosed)
 
 	p.mu.Lock()
 	defer p.mu.Unlock()

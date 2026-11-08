@@ -50,13 +50,30 @@ type Recovered struct {
 	Stack []byte
 }
 
-// Error implements the error interface, returning the panic value and the
-// captured stack trace.
+// Error implements the error interface, returning the panic value on a single
+// line. The stack is left out so that joined errors and log lines stay
+// readable; format with %+v, or read [Recovered.Stack], to include it.
 func (r *Recovered) Error() string {
 	if r == nil {
 		return "panic: <nil>"
 	}
-	return fmt.Sprintf("panic: %v\n\n%s", r.Value, r.Stack)
+	return fmt.Sprintf("panic: %v", r.Value)
+}
+
+// Format implements [fmt.Formatter]. %+v prints the single line from
+// [Recovered.Error] followed by the stack captured at the panic site. Every
+// other verb formats the Error string as fmt would format any string, so
+// width, precision, %q, and %x all behave as usual.
+//
+// The stack is only printed when the Recovered itself is formatted. An error
+// that wraps it, such as one from [errors.Join], formats through Error and
+// leaves the stack out.
+func (r *Recovered) Format(s fmt.State, verb rune) {
+	if verb == 'v' && s.Flag('+') && r != nil {
+		fmt.Fprintf(s, "%s\n\n%s", r.Error(), r.Stack)
+		return
+	}
+	fmt.Fprintf(s, fmt.FormatString(s, verb), r.Error())
 }
 
 // Is reports whether this Recovered matches target. It returns true when
@@ -125,6 +142,10 @@ func (c *Catcher) tryRecover() {
 // Recovered returns the first panic captured by [Catcher.Try], or nil if no
 // panic occurred.
 func (c *Catcher) Recovered() *Recovered { return c.recovered.Load() }
+
+// Reset clears any captured panic so the Catcher can be reused. It must not
+// be called concurrently with [Catcher.Try].
+func (c *Catcher) Reset() { c.recovered.Store(nil) }
 
 // Repanic re-panics with the captured [Recovered] value. It is a no-op when
 // no panic was captured. Because the stack trace inside Recovered was captured

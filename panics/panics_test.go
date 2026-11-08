@@ -1,6 +1,8 @@
 package panics_test
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -147,4 +149,61 @@ func TestCatcher_FirstPanicWins(t *testing.T) {
 		require.NotNil(t, r)
 		assert.Equal(t, first, r.Value)
 	})
+}
+
+func TestRecovered_ErrorIsSingleLine(t *testing.T) {
+	var c panics.Catcher
+	c.Try(func() { panic("boom") })
+
+	assert.Equal(t, "panic: boom", c.Recovered().Error())
+}
+
+func TestRecovered_FormatVerbs(t *testing.T) {
+	var c panics.Catcher
+	c.Try(func() { panic("boom") })
+	r := c.Recovered()
+
+	assert.Equal(t, "panic: boom", fmt.Sprintf("%v", r))
+	assert.Equal(t, "panic: boom", fmt.Sprintf("%s", r))
+	assert.Equal(t, `"panic: boom"`, fmt.Sprintf("%q", r))
+	assert.Equal(t, "panic: boom\n\n"+string(r.Stack), fmt.Sprintf("%+v", r), "%+v must append the stack captured at the panic site")
+}
+
+func TestRecovered_FormatNilReceiver(t *testing.T) {
+	var r *panics.Recovered
+
+	assert.Equal(t, "panic: <nil>", fmt.Sprintf("%+v", r))
+}
+
+func TestRecovered_JoinedErrorsStayReadable(t *testing.T) {
+	var c1, c2 panics.Catcher
+	c1.Try(func() { panic("first") })
+	c2.Try(func() { panic("second") })
+
+	err := errors.Join(c1.Recovered(), c2.Recovered())
+	assert.Equal(t, "panic: first\npanic: second", err.Error())
+}
+
+func TestCatcher_Reset_AllowsReuseAfterPanic(t *testing.T) {
+	var c panics.Catcher
+	c.Try(func() { panic("first") })
+	require.NotNil(t, c.Recovered())
+
+	c.Reset()
+	assert.Nil(t, c.Recovered(), "Reset must clear the captured panic")
+
+	c.Try(func() { panic("second") })
+	require.NotNil(t, c.Recovered())
+	assert.Equal(t, "second", c.Recovered().Value, "a panic after Reset must be captured, not dropped")
+}
+
+func TestRecovered_FormatKeepsStringFormattingOptions(t *testing.T) {
+	var c panics.Catcher
+	c.Try(func() { panic("boom") })
+	r := c.Recovered()
+
+	assert.Equal(t, "panic", fmt.Sprintf("%.5s", r), "precision must truncate like a plain string")
+	assert.Equal(t, "   panic: boom", fmt.Sprintf("%14v", r), "width must pad like a plain string")
+	assert.Equal(t, fmt.Sprintf("%x", "panic: boom"), fmt.Sprintf("%x", r), "%x must not drop the error")
+	assert.Equal(t, fmt.Sprintf("%X", "panic: boom"), fmt.Sprintf("%X", r), "%X must not drop the error")
 }

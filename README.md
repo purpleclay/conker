@@ -132,7 +132,7 @@ var wg conker.WaitGroup
 wg.Go(riskyOperation)
 
 if r := wg.WaitAndRecover(); r != nil {
-    log.Printf("goroutine panicked: %v\n%s", r.Value, r.Stack)
+    log.Printf("goroutine panicked: %+v", r) // %+v adds the stack from the panic site
 }
 ```
 
