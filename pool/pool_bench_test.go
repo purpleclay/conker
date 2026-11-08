@@ -2,6 +2,7 @@ package pool_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"testing"
@@ -117,6 +118,29 @@ func BenchmarkResultPool_Go_WithCapacity(b *testing.B) {
 				}
 				_, err := p.Wait()
 				require.NoError(b, err)
+			}
+		})
+	}
+}
+
+var errBench = errors.New("bench task failed")
+
+var failingResult = func(_ context.Context) (struct{}, error) { return struct{}{}, errBench }
+
+// BenchmarkResultPool_Go_Errors measures the error path, where every task
+// fails and Wait joins every error.
+func BenchmarkResultPool_Go_Errors(b *testing.B) {
+	for _, workers := range workerCounts() {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			p := pool.NewWithResults[struct{}]().WithMaxGoroutines(workers)
+			b.ReportAllocs()
+			for b.Loop() {
+				for range benchTasks {
+					p.Go(failingResult)
+				}
+				_, err := p.Wait()
+				require.Error(b, err)
+				p.Reset()
 			}
 		})
 	}

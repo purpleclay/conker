@@ -1118,3 +1118,73 @@ func TestResultPool_TryGo_PreservesSubmissionOrderAcrossRejection(t *testing.T) 
 		assert.Equal(t, []int{1, 2, 3}, results)
 	})
 }
+
+func TestResultPool_Wait_ErrorOrderMatchesErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(2)
+
+		errA := errors.New("error a")
+		errB := errors.New("error b")
+
+		// Submit in order but fail in reverse: task B errors first.
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
+
+		_, err := p.Wait()
+		joined, ok := err.(interface{ Unwrap() []error })
+		require.True(t, ok, "Wait must return errors.Join of task errors")
+		assert.Equal(t, []error{errA, errB}, joined.Unwrap(), "Wait must report errors in submission order")
+		assert.Equal(t, p.Errors(), joined.Unwrap(), "Wait and Errors must agree on order")
+	})
+}
+
+func TestResultPool_Wait_UnorderedErrorOrderMatchesErrors(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithUnorderedResults()
+
+		errA := errors.New("error a")
+		errB := errors.New("error b")
+
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
+		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
+
+		_, err := p.Wait()
+		joined, ok := err.(interface{ Unwrap() []error })
+		require.True(t, ok, "Wait must return errors.Join of task errors")
+		assert.Equal(t, []error{errB, errA}, joined.Unwrap(), "unordered Wait must report errors in completion order")
+		assert.Equal(t, p.Errors(), joined.Unwrap(), "Wait and Errors must agree on order")
+	})
+}
+
+func TestResultPool_Reset_ClearsFirstErrorAfterFailedBatch(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithFirstError().WithCancelOnError()
+
+		errOld := errors.New("old batch failed")
+		p.Go(func(_ context.Context) (int, error) { return 0, errOld })
+		_, err := p.Wait()
+		require.Same(t, errOld, err)
+
+		p.Reset()
+		p.Go(func(_ context.Context) (int, error) { return 1, nil })
+		_, err = p.Wait()
+		require.NoError(t, err, "a successful batch after Reset must not return the old error")
+
+		p.Reset()
+		errNew := errors.New("new batch failed")
+		var cause error
+		p.Go(func(ctx context.Context) (int, error) {
+			<-ctx.Done()
+			cause = context.Cause(ctx)
+			return 0, ctx.Err()
+		})
+		p.Go(func(_ context.Context) (int, error) {
+			time.Sleep(time.Second)
+			return 0, errNew
+		})
+
+		_, err = p.Wait()
+		assert.Same(t, errNew, err, "the new batch's first failure must be the returned error")
+		assert.Same(t, errNew, cause, "the new batch's first failure must be the cancellation cause")
+	})
+}
