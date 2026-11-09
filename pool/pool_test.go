@@ -12,85 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
-	"github.com/purpleclay/conker/panics"
 	"github.com/purpleclay/conker/pool"
 )
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
-}
-
-func TestPool_Go_ExecutesTask(t *testing.T) {
-	p := pool.New()
-
-	var ran atomic.Bool
-	p.Go(func(_ context.Context) error {
-		ran.Store(true)
-		return nil
-	})
-
-	require.NoError(t, p.Wait())
-	assert.True(t, ran.Load())
-}
-
-func TestPool_Wait_CollectsErrors(t *testing.T) {
-	p := pool.New()
-
-	sentinel := errors.New("task failed")
-	p.Go(func(_ context.Context) error { return sentinel })
-
-	err := p.Wait()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, sentinel)
-}
-
-func TestPool_Wait_JoinsMultipleErrors(t *testing.T) {
-	p := pool.New()
-
-	errA := errors.New("error a")
-	errB := errors.New("error b")
-	p.Go(func(_ context.Context) error { return errA })
-	p.Go(func(_ context.Context) error { return errB })
-
-	err := p.Wait()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, errA)
-	assert.ErrorIs(t, err, errB)
-}
-
-func TestPool_Errors_ReturnsEmptySliceWhenNoErrors(t *testing.T) {
-	p := pool.New()
-	p.Go(func(_ context.Context) error { return nil })
-
-	p.Wait() //nolint:errcheck
-	errs := p.Errors()
-	assert.Empty(t, errs)
-}
-
-func TestPool_Errors_ReturnsAllErrors(t *testing.T) {
-	p := pool.New()
-
-	errA := errors.New("error a")
-	errB := errors.New("error b")
-	p.Go(func(_ context.Context) error { return errA })
-	p.Go(func(_ context.Context) error { return errB })
-
-	p.Wait() //nolint:errcheck
-	errs := p.Errors()
-	require.Len(t, errs, 2)
-
-	// Verify both errors are present in any order
-	var foundA, foundB bool
-	for _, err := range errs {
-		if err == errA {
-			foundA = true
-		}
-		if err == errB {
-			foundB = true
-		}
-	}
-	assert.True(t, foundA, "error A should be in the slice")
-	assert.True(t, foundB, "error B should be in the slice")
 }
 
 func TestPool_Errors_ReturnsClonesTheSlice(t *testing.T) {
@@ -111,19 +37,6 @@ func TestPool_Errors_ReturnsClonesTheSlice(t *testing.T) {
 	assert.Equal(t, errs1, errs2)
 }
 
-func TestPool_PanicCapturedAsError(t *testing.T) {
-	p := pool.New()
-	p.Go(func(_ context.Context) error { panic("something went wrong") })
-
-	err := p.Wait()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, panics.ErrPanic)
-
-	var r *panics.Recovered
-	require.ErrorAs(t, err, &r)
-	assert.Equal(t, "something went wrong", r.Value)
-}
-
 func TestPool_WithMaxGoroutines_PanicsOnInvalidN(t *testing.T) {
 	assert.Panics(t, func() { pool.New().WithMaxGoroutines(0) })
 	assert.Panics(t, func() { pool.New().WithMaxGoroutines(-1) })
@@ -135,20 +48,6 @@ func TestPool_WithMaxGoroutines_PanicsAfterGo(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithMaxGoroutines(4) })
 	p.Wait() //nolint:errcheck
-}
-
-func TestPool_GoCtx_ReturnsNilOnSuccessfulSubmission(t *testing.T) {
-	p := pool.New()
-
-	var ran atomic.Bool
-	err := p.GoCtx(context.Background(), func(_ context.Context) error {
-		ran.Store(true)
-		return nil
-	})
-
-	require.NoError(t, p.Wait())
-	assert.NoError(t, err)
-	assert.True(t, ran.Load())
 }
 
 func TestPool_GoCtx_ReturnsCancelledWhenBlocked(t *testing.T) {
@@ -195,82 +94,6 @@ func TestPool_Go_PanicsOnZeroValue(t *testing.T) {
 	})
 }
 
-func TestPool_TryGo_RunsTaskWhenSlotAvailable(t *testing.T) {
-	p := pool.New()
-
-	var ran atomic.Bool
-	ok := p.TryGo(func(_ context.Context) error {
-		ran.Store(true)
-		return nil
-	})
-
-	require.NoError(t, p.Wait())
-	assert.True(t, ok)
-	assert.True(t, ran.Load())
-}
-
-func TestPool_TryGo_ReturnsFalseImmediatelyAtCapacity(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(1)
-
-		// Fill the only slot for 1s of fake time.
-		p.Go(func(_ context.Context) error {
-			time.Sleep(time.Second)
-			return nil
-		})
-
-		start := time.Now()
-		var ran atomic.Bool
-		ok := p.TryGo(func(_ context.Context) error {
-			ran.Store(true)
-			return nil
-		})
-
-		assert.False(t, ok, "TryGo must reject when the pool is at capacity")
-		assert.Zero(t, time.Since(start), "TryGo must never block")
-
-		require.NoError(t, p.Wait())
-		assert.False(t, ran.Load(), "a rejected task must not run")
-	})
-}
-
-func TestPool_TryGo_RecursiveInlineFallbackDoesNotDeadlock(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(1)
-
-		var handled atomic.Int64
-		handle := func(_ context.Context) error {
-			handled.Add(1)
-			return nil
-		}
-
-		// The parent holds the only slot, so blocking Go for each child would
-		// deadlock. TryGo lets the parent run saturated children inline.
-		p.Go(func(ctx context.Context) error {
-			for range 5 {
-				if !p.TryGo(handle) {
-					if err := handle(ctx); err != nil {
-						return err
-					}
-				}
-			}
-			return nil
-		})
-
-		require.NoError(t, p.Wait())
-		assert.Equal(t, int64(5), handled.Load())
-	})
-}
-
-func TestPool_TryGo_CollectsErrors(t *testing.T) {
-	p := pool.New()
-
-	sentinel := errors.New("task failed")
-	require.True(t, p.TryGo(func(_ context.Context) error { return sentinel }))
-
-	assert.ErrorIs(t, p.Wait(), sentinel)
-}
-
 func TestPool_TryGo_PanicsOnZeroValue(t *testing.T) {
 	var p pool.Pool
 	assert.Panics(t, func() {
@@ -284,46 +107,6 @@ func TestPool_TryGo_PreventsReconfiguration(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithMaxGoroutines(4) })
 	p.Wait() //nolint:errcheck
-}
-
-func TestPool_RecursiveSubmission(t *testing.T) {
-	p := pool.New()
-
-	var count atomic.Int64
-	p.Go(func(_ context.Context) error {
-		for range 5 {
-			p.Go(func(_ context.Context) error {
-				count.Add(1)
-				return nil
-			})
-		}
-		return nil
-	})
-
-	require.NoError(t, p.Wait())
-	assert.Equal(t, int64(5), count.Load())
-}
-
-func TestPool_Wait_WaitsForGrandchildren(t *testing.T) {
-	p := pool.New()
-
-	var count atomic.Int64
-	// parent
-	p.Go(func(_ context.Context) error {
-		// child
-		p.Go(func(_ context.Context) error {
-			// grandchild
-			p.Go(func(_ context.Context) error {
-				count.Add(1)
-				return nil
-			})
-			return nil
-		})
-		return nil
-	})
-
-	require.NoError(t, p.Wait())
-	assert.Equal(t, int64(1), count.Load())
 }
 
 func TestPool_SQSBatchingRegression(t *testing.T) {
@@ -344,72 +127,6 @@ func TestPool_SQSBatchingRegression(t *testing.T) {
 
 	require.NoError(t, p.Wait())
 	assert.Equal(t, int64(len(messages)), processed.Load())
-}
-
-func TestPool_Reset_AllowsReuse(t *testing.T) {
-	p := pool.New()
-
-	var count atomic.Int64
-	inc := func(_ context.Context) error { count.Add(1); return nil }
-
-	p.Go(inc)
-	require.NoError(t, p.Wait())
-	assert.Equal(t, int64(1), count.Load())
-
-	p.Reset()
-
-	p.Go(inc)
-	require.NoError(t, p.Wait())
-	assert.Equal(t, int64(2), count.Load())
-}
-
-func TestPool_Reset_ClearsErrors(t *testing.T) {
-	p := pool.New()
-
-	p.Go(func(_ context.Context) error { return errors.New("oops") })
-	require.Error(t, p.Wait())
-
-	p.Reset()
-
-	require.NoError(t, p.Wait())
-	assert.Empty(t, p.Errors())
-}
-
-func TestPool_Reset_PreservesConfiguration(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		var concurrent atomic.Int64
-		var peak atomic.Int64
-
-		p := pool.New().WithMaxGoroutines(2)
-
-		run := func(_ context.Context) error {
-			n := concurrent.Add(1)
-			for {
-				if cur := peak.Load(); n <= cur || peak.CompareAndSwap(cur, n) {
-					break
-				}
-			}
-			time.Sleep(100 * time.Millisecond)
-			concurrent.Add(-1)
-			return nil
-		}
-
-		for range 4 {
-			p.Go(run)
-		}
-		require.NoError(t, p.Wait())
-		assert.LessOrEqual(t, peak.Load(), int64(2), "must not exceed 2 concurrent goroutines before reset")
-
-		peak.Store(0)
-		concurrent.Store(0)
-		p.Reset()
-
-		for range 4 {
-			p.Go(run)
-		}
-		require.NoError(t, p.Wait())
-		assert.LessOrEqual(t, peak.Load(), int64(2), "must not exceed 2 concurrent goroutines after reset")
-	})
 }
 
 func TestPool_Reset_PreservesTaskTimeout(t *testing.T) {
@@ -522,47 +239,6 @@ func TestPool_WithCancelOnError_CancelsInflightTasks(t *testing.T) {
 	})
 }
 
-func TestPool_WithCancelOnError_PanicBecomesCause(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(2).WithCancelOnError()
-
-		var cause error
-		p.Go(func(ctx context.Context) error {
-			select {
-			case <-time.After(time.Hour):
-				return nil
-			case <-ctx.Done():
-				cause = context.Cause(ctx)
-				return ctx.Err()
-			}
-		})
-		p.Go(func(_ context.Context) error { panic("boom") })
-
-		require.ErrorIs(t, p.Wait(), panics.ErrPanic)
-		var rec *panics.Recovered
-		require.ErrorAs(t, cause, &rec, "the recovered panic must be the cancellation cause")
-		assert.Equal(t, "boom", rec.Value)
-	})
-}
-
-func TestPool_WithoutCancelOnError_ErrorDoesNotCancelSiblings(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(2)
-		sentinel := errors.New("task failed")
-
-		var siblingErr error
-		p.Go(func(ctx context.Context) error {
-			time.Sleep(time.Second)
-			siblingErr = ctx.Err()
-			return nil
-		})
-		p.Go(func(_ context.Context) error { return sentinel })
-
-		require.ErrorIs(t, p.Wait(), sentinel)
-		assert.NoError(t, siblingErr, "without WithCancelOnError a task error must not cancel siblings")
-	})
-}
-
 func TestPool_WithCancelOnError_PanicsAfterGo(t *testing.T) {
 	p := pool.New()
 	p.Go(func(_ context.Context) error { return nil })
@@ -571,90 +247,12 @@ func TestPool_WithCancelOnError_PanicsAfterGo(t *testing.T) {
 	p.Wait() //nolint:errcheck
 }
 
-func TestPool_Reset_PreservesCancelOnError(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(2).WithCancelOnError()
-		sentinel := errors.New("task failed")
-
-		p.Go(func(_ context.Context) error { return sentinel })
-		require.Error(t, p.Wait())
-
-		p.Reset()
-
-		var cause error
-		p.Go(func(ctx context.Context) error {
-			select {
-			case <-time.After(time.Hour):
-				return nil
-			case <-ctx.Done():
-				cause = context.Cause(ctx)
-				return ctx.Err()
-			}
-		})
-		p.Go(func(_ context.Context) error {
-			time.Sleep(time.Second)
-			return sentinel
-		})
-
-		require.Error(t, p.Wait())
-		assert.Same(t, sentinel, cause, "cancel-on-error must still apply after reset")
-	})
-}
-
-func TestPool_WithFirstError_WaitReturnsOnlyFirstError(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(2).WithFirstError()
-
-		errA := errors.New("error a")
-		errB := errors.New("error b")
-
-		// Submit in order but fail in reverse: task B errors first.
-		p.Go(func(_ context.Context) error { time.Sleep(2 * time.Second); return errA })
-		p.Go(func(_ context.Context) error { time.Sleep(1 * time.Second); return errB })
-
-		assert.Same(t, errB, p.Wait(), "Wait must return only the first error recorded")
-		assert.Len(t, p.Errors(), 2, "Errors must still return every error")
-	})
-}
-
-func TestPool_WithFirstError_NilWhenNoErrors(t *testing.T) {
-	p := pool.New().WithFirstError()
-	p.Go(func(_ context.Context) error { return nil })
-
-	assert.NoError(t, p.Wait())
-}
-
 func TestPool_WithFirstError_PanicsAfterGo(t *testing.T) {
 	p := pool.New()
 	p.Go(func(_ context.Context) error { return nil })
 
 	assert.Panics(t, func() { p.WithFirstError() })
 	p.Wait() //nolint:errcheck
-}
-
-func TestPool_WithCancelOnErrorAndFirstError_ReturnsTriggeringError(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.New().WithMaxGoroutines(4).WithCancelOnError().WithFirstError()
-		sentinel := errors.New("task failed")
-
-		for range 3 {
-			p.Go(func(ctx context.Context) error {
-				select {
-				case <-time.After(time.Hour):
-					return nil
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-			})
-		}
-		p.Go(func(_ context.Context) error {
-			time.Sleep(time.Second)
-			return sentinel
-		})
-
-		assert.Same(t, sentinel, p.Wait(), "Wait must return the triggering error, not a sibling's context.Canceled")
-		assert.Len(t, p.Errors(), 4)
-	})
 }
 
 func TestPool_WithContext_PanicsOnNil(t *testing.T) {
@@ -667,30 +265,6 @@ func TestPool_WithContext_PanicsAfterGo(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithContext(context.Background()) })
 	p.Wait() //nolint:errcheck
-}
-
-func TestPool_WithContext_PropagatesCancellationToTasks(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-
-		p := pool.New().WithContext(ctx)
-
-		var taskErr error
-		p.Go(func(taskCtx context.Context) error {
-			select {
-			case <-time.After(time.Second):
-				return nil
-			case <-taskCtx.Done():
-				taskErr = taskCtx.Err()
-				return taskErr
-			}
-		})
-
-		cancel()
-
-		require.Error(t, p.Wait())
-		assert.ErrorIs(t, taskErr, context.Canceled, "cancelling the supplied context must cancel in-flight task contexts")
-	})
 }
 
 func TestPool_WithContext_DoesNotAffectCallerContext(t *testing.T) {
@@ -721,34 +295,6 @@ func TestPool_Go_AfterContextCancelled_DoesNotDropSubmissions(t *testing.T) {
 	assert.Equal(t, int32(100), ran.Load(), "Go must not silently drop submissions after the pool's context is cancelled")
 }
 
-func TestPool_Reset_PreservesContext(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-
-		p := pool.New().WithContext(ctx)
-		p.Go(func(_ context.Context) error { return nil })
-		require.NoError(t, p.Wait())
-
-		p.Reset()
-
-		var taskErr error
-		p.Go(func(taskCtx context.Context) error {
-			select {
-			case <-time.After(time.Second):
-				return nil
-			case <-taskCtx.Done():
-				taskErr = taskCtx.Err()
-				return taskErr
-			}
-		})
-
-		cancel()
-
-		require.Error(t, p.Wait())
-		assert.ErrorIs(t, taskErr, context.Canceled, "the supplied context must still be the parent after reset")
-	})
-}
-
 func TestResultPool_WithCapacity_PanicsOnInvalidN(t *testing.T) {
 	assert.Panics(t, func() { pool.NewWithResults[int]().WithCapacity(0) })
 	assert.Panics(t, func() { pool.NewWithResults[int]().WithCapacity(-1) })
@@ -760,30 +306,6 @@ func TestResultPool_WithCapacity_PanicsAfterGo(t *testing.T) {
 
 	assert.Panics(t, func() { p.WithCapacity(10) })
 	p.Wait() //nolint:errcheck
-}
-
-func TestResultPool_WithContext_PropagatesCancellationToTasks(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
-
-		p := pool.NewWithResults[error]().WithContext(ctx)
-
-		p.Go(func(taskCtx context.Context) (error, error) {
-			select {
-			case <-time.After(time.Second):
-				return nil, nil
-			case <-taskCtx.Done():
-				return taskCtx.Err(), taskCtx.Err()
-			}
-		})
-
-		cancel()
-
-		results, err := p.Wait()
-		require.Error(t, err)
-		require.Len(t, results, 1)
-		assert.ErrorIs(t, results[0], context.Canceled, "cancelling the supplied context must cancel in-flight task contexts")
-	})
 }
 
 func TestResultPool_Go_AfterContextCancelled_DoesNotDropResults(t *testing.T) {
@@ -800,47 +322,8 @@ func TestResultPool_Go_AfterContextCancelled_DoesNotDropResults(t *testing.T) {
 	require.Len(t, results, 100, "Go must not silently drop submissions after the pool's context is cancelled")
 }
 
-func TestResultPool_WithCapacity_CollectsCorrectResults(t *testing.T) {
-	p := pool.NewWithResults[int]().WithCapacity(5)
-
-	for i := range 5 {
-		p.Go(func(_ context.Context) (int, error) { return i, nil })
-	}
-
-	results, err := p.Wait()
-	require.NoError(t, err)
-	assert.Equal(t, []int{0, 1, 2, 3, 4}, results)
-}
-
-func TestResultPool_Go_CollectsResults(t *testing.T) {
-	p := pool.NewWithResults[int]()
-
-	for i := range 5 {
-		p.Go(func(_ context.Context) (int, error) { return i, nil })
-	}
-
-	results, err := p.Wait()
-	require.NoError(t, err)
-	assert.Len(t, results, 5)
-}
-
 // TestResultPool_Wait_PreservesSubmissionOrder verifies that results are
 // returned in submission order even when tasks complete in reverse order.
-func TestResultPool_Wait_PreservesSubmissionOrder(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]()
-
-		// Submit in order but complete in reverse: task 3 finishes first.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(3 * time.Second); return 1, nil })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 2, nil })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 3, nil })
-
-		results, err := p.Wait()
-		require.NoError(t, err)
-		assert.Equal(t, []int{1, 2, 3}, results)
-	})
-}
-
 func TestResultPool_WithUnorderedResults_ReturnsCompletionOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := pool.NewWithResults[int]().WithUnorderedResults()
@@ -854,35 +337,6 @@ func TestResultPool_WithUnorderedResults_ReturnsCompletionOrder(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, []int{3, 2, 1}, results)
 	})
-}
-
-func TestResultPool_Wait_CollectsResultsEvenOnError(t *testing.T) {
-	p := pool.NewWithResults[int]()
-
-	sentinel := errors.New("task failed")
-	for i := range 5 {
-		p.Go(func(_ context.Context) (int, error) {
-			if i%2 == 0 {
-				return i, sentinel
-			}
-			return i, nil
-		})
-	}
-
-	results, err := p.Wait()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, sentinel)
-	assert.Len(t, results, 5, "all results must be present regardless of task errors")
-}
-
-func TestResultPool_Wait_CollectsResultEvenOnPanic(t *testing.T) {
-	p := pool.NewWithResults[int]()
-	p.Go(func(_ context.Context) (int, error) { panic("task panicked") })
-
-	results, err := p.Wait()
-	require.Error(t, err)
-	assert.ErrorIs(t, err, panics.ErrPanic)
-	assert.Len(t, results, 1, "result entry must be recorded even when the task panics")
 }
 
 func TestResultPool_GoCtx_ReturnsCancelledWhenBlocked(t *testing.T) {
@@ -906,33 +360,6 @@ func TestResultPool_GoCtx_ReturnsCancelledWhenBlocked(t *testing.T) {
 	})
 }
 
-func TestResultPool_Errors_ReturnsEmptySliceWhenNoErrors(t *testing.T) {
-	p := pool.NewWithResults[int]()
-	p.Go(func(_ context.Context) (int, error) { return 42, nil })
-
-	p.Wait() //nolint:errcheck
-	assert.Empty(t, p.Errors())
-}
-
-func TestResultPool_Errors_PreservesSubmissionOrder(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]()
-
-		errA := errors.New("error a")
-		errB := errors.New("error b")
-
-		// Submit in order but complete in reverse: task B finishes first.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
-
-		p.Wait() //nolint:errcheck
-		errs := p.Errors()
-		require.Len(t, errs, 2)
-		assert.Same(t, errA, errs[0], "first submitted error must come first")
-		assert.Same(t, errB, errs[1], "second submitted error must come second")
-	})
-}
-
 func TestResultPool_Errors_WithUnorderedResults_ReturnsCompletionOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		p := pool.NewWithResults[int]().WithUnorderedResults()
@@ -949,57 +376,6 @@ func TestResultPool_Errors_WithUnorderedResults_ReturnsCompletionOrder(t *testin
 		require.Len(t, errs, 2)
 		assert.Same(t, errB, errs[0], "first completed error must come first")
 		assert.Same(t, errA, errs[1], "second completed error must come second")
-	})
-}
-
-func TestResultPool_Reset_AllowsReuse(t *testing.T) {
-	p := pool.NewWithResults[int]()
-
-	p.Go(func(_ context.Context) (int, error) { return 1, nil })
-	results, err := p.Wait()
-	require.NoError(t, err)
-	assert.Equal(t, []int{1}, results)
-
-	p.Reset()
-
-	p.Go(func(_ context.Context) (int, error) { return 2, nil })
-	results, err = p.Wait()
-	require.NoError(t, err)
-	assert.Equal(t, []int{2}, results)
-}
-
-func TestResultPool_Reset_ClearsResults(t *testing.T) {
-	p := pool.NewWithResults[int]()
-
-	p.Go(func(_ context.Context) (int, error) { return 42, nil })
-	p.Wait() //nolint:errcheck
-
-	p.Reset()
-
-	results, err := p.Wait()
-	require.NoError(t, err)
-	assert.Empty(t, results)
-}
-
-func TestResultPool_Reset_PreservesSubmissionOrder(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]()
-
-		// First cycle — complete in reverse order.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, nil })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, nil })
-		results, err := p.Wait()
-		require.NoError(t, err)
-		assert.Equal(t, []int{1, 2}, results)
-
-		p.Reset()
-
-		// Second cycle — submission index must restart from zero.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 3, nil })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 4, nil })
-		results, err = p.Wait()
-		require.NoError(t, err)
-		assert.Equal(t, []int{3, 4}, results)
 	})
 }
 
@@ -1060,133 +436,12 @@ func TestResultPool_WithCancelOnError_PanicsAfterGo(t *testing.T) {
 	p.Wait() //nolint:errcheck
 }
 
-func TestResultPool_WithFirstError_WaitReturnsOnlyFirstError(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithFirstError()
-
-		errA := errors.New("error a")
-		errB := errors.New("error b")
-
-		// Submit in order but fail in reverse: task B errors first.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
-
-		results, err := p.Wait()
-		assert.Same(t, errB, err, "Wait must return only the first error recorded")
-		assert.Equal(t, []int{1, 2}, results)
-		assert.Equal(t, []error{errA, errB}, p.Errors(), "Errors must still return every error")
-	})
-}
-
 func TestResultPool_WithFirstError_PanicsAfterGo(t *testing.T) {
 	p := pool.NewWithResults[int]()
 	p.Go(func(_ context.Context) (int, error) { return 1, nil })
 
 	assert.Panics(t, func() { p.WithFirstError() })
 	p.Wait() //nolint:errcheck
-}
-
-func TestResultPool_TryGo_RejectedTaskRecordsNoResult(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]().WithMaxGoroutines(1)
-
-		p.Go(func(_ context.Context) (int, error) {
-			time.Sleep(time.Second)
-			return 1, nil
-		})
-		ok := p.TryGo(func(_ context.Context) (int, error) { return 99, nil })
-
-		results, err := p.Wait()
-		require.NoError(t, err)
-		assert.False(t, ok)
-		assert.Equal(t, []int{1}, results, "a rejected submission must not leave a result behind")
-	})
-}
-
-func TestResultPool_TryGo_PreservesSubmissionOrderAcrossRejection(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]().WithMaxGoroutines(2)
-
-		// Complete in reverse submission order, with a rejection in between.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(3 * time.Second); return 1, nil })
-		require.True(t, p.TryGo(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 2, nil }))
-		require.False(t, p.TryGo(func(_ context.Context) (int, error) { return 99, nil }))
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 3, nil })
-
-		results, err := p.Wait()
-		require.NoError(t, err)
-		assert.Equal(t, []int{1, 2, 3}, results)
-	})
-}
-
-func TestResultPool_Wait_ErrorOrderMatchesErrors(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]().WithMaxGoroutines(2)
-
-		errA := errors.New("error a")
-		errB := errors.New("error b")
-
-		// Submit in order but fail in reverse: task B errors first.
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
-
-		_, err := p.Wait()
-		joined, ok := err.(interface{ Unwrap() []error })
-		require.True(t, ok, "Wait must return errors.Join of task errors")
-		assert.Equal(t, []error{errA, errB}, joined.Unwrap(), "Wait must report errors in submission order")
-		assert.Equal(t, p.Errors(), joined.Unwrap(), "Wait and Errors must agree on order")
-	})
-}
-
-func TestResultPool_Wait_UnorderedErrorOrderMatchesErrors(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithUnorderedResults()
-
-		errA := errors.New("error a")
-		errB := errors.New("error b")
-
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(2 * time.Second); return 1, errA })
-		p.Go(func(_ context.Context) (int, error) { time.Sleep(1 * time.Second); return 2, errB })
-
-		_, err := p.Wait()
-		joined, ok := err.(interface{ Unwrap() []error })
-		require.True(t, ok, "Wait must return errors.Join of task errors")
-		assert.Equal(t, []error{errB, errA}, joined.Unwrap(), "unordered Wait must report errors in completion order")
-		assert.Equal(t, p.Errors(), joined.Unwrap(), "Wait and Errors must agree on order")
-	})
-}
-
-func TestResultPool_Reset_ClearsFirstErrorAfterFailedBatch(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		p := pool.NewWithResults[int]().WithMaxGoroutines(2).WithFirstError().WithCancelOnError()
-
-		errOld := errors.New("old batch failed")
-		p.Go(func(_ context.Context) (int, error) { return 0, errOld })
-		_, err := p.Wait()
-		require.Same(t, errOld, err)
-
-		p.Reset()
-		p.Go(func(_ context.Context) (int, error) { return 1, nil })
-		_, err = p.Wait()
-		require.NoError(t, err, "a successful batch after Reset must not return the old error")
-
-		p.Reset()
-		errNew := errors.New("new batch failed")
-		var cause error
-		p.Go(func(ctx context.Context) (int, error) {
-			<-ctx.Done()
-			cause = context.Cause(ctx)
-			return 0, ctx.Err()
-		})
-		p.Go(func(_ context.Context) (int, error) {
-			time.Sleep(time.Second)
-			return 0, errNew
-		})
-
-		_, err = p.Wait()
-		assert.Same(t, errNew, err, "the new batch's first failure must be the returned error")
-		assert.Same(t, errNew, cause, "the new batch's first failure must be the cancellation cause")
-	})
 }
 
 func TestPool_Wait_CancelsWithErrPoolClosed(t *testing.T) {

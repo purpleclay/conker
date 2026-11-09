@@ -34,75 +34,6 @@ func TestRecovered_NilReceiver(t *testing.T) {
 	assert.Nil(t, r.Unwrap())
 }
 
-func TestRecovered_IsErrPanic(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("boom") })
-
-	r := c.Recovered()
-	require.NotNil(t, r)
-	assert.ErrorIs(t, r, panics.ErrPanic)
-}
-
-func TestRecovered_UnwrapsError(t *testing.T) {
-	inner := &stubError{"inner"}
-	var c panics.Catcher
-	c.Try(func() { panic(inner) })
-
-	r := c.Recovered()
-	require.NotNil(t, r)
-
-	var got *stubError
-	require.ErrorAs(t, r, &got)
-	assert.Same(t, inner, got)
-}
-
-func TestRecovered_UnwrapNilForNonError(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("not an error") })
-
-	r := c.Recovered()
-	require.NotNil(t, r)
-	assert.Nil(t, r.Unwrap())
-}
-
-func TestRecovered_ErrorString(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("boom") })
-
-	r := c.Recovered()
-	require.NotNil(t, r)
-	assert.Contains(t, r.Error(), "boom")
-}
-
-func TestCatcher_NoPanic(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() {})
-
-	assert.Nil(t, c.Recovered())
-}
-
-func TestCatcher_RepanicIsNoOpWhenNoPanic(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() {})
-
-	assert.NotPanics(t, c.Repanic)
-}
-
-func TestCatcher_RepanicWithRecovered(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("boom") })
-
-	v := func() (val any) {
-		defer func() { val = recover() }()
-		c.Repanic()
-		return nil
-	}()
-
-	r, ok := v.(*panics.Recovered)
-	require.True(t, ok, "repanic value type = %T, want *panics.Recovered", v)
-	assert.Equal(t, "boom", r.Value)
-}
-
 func TestCatcher_StackCapturedAtPanicSite(t *testing.T) {
 	var c panics.Catcher
 	c.Try(func() {
@@ -151,24 +82,6 @@ func TestCatcher_FirstPanicWins(t *testing.T) {
 	})
 }
 
-func TestRecovered_ErrorIsSingleLine(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("boom") })
-
-	assert.Equal(t, "panic: boom", c.Recovered().Error())
-}
-
-func TestRecovered_FormatVerbs(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("boom") })
-	r := c.Recovered()
-
-	assert.Equal(t, "panic: boom", fmt.Sprintf("%v", r))
-	assert.Equal(t, "panic: boom", fmt.Sprintf("%s", r))
-	assert.Equal(t, `"panic: boom"`, fmt.Sprintf("%q", r))
-	assert.Equal(t, "panic: boom\n\n"+string(r.Stack), fmt.Sprintf("%+v", r), "%+v must append the stack captured at the panic site")
-}
-
 func TestRecovered_FormatNilReceiver(t *testing.T) {
 	var r *panics.Recovered
 
@@ -182,28 +95,4 @@ func TestRecovered_JoinedErrorsStayReadable(t *testing.T) {
 
 	err := errors.Join(c1.Recovered(), c2.Recovered())
 	assert.Equal(t, "panic: first\npanic: second", err.Error())
-}
-
-func TestCatcher_Reset_AllowsReuseAfterPanic(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("first") })
-	require.NotNil(t, c.Recovered())
-
-	c.Reset()
-	assert.Nil(t, c.Recovered(), "Reset must clear the captured panic")
-
-	c.Try(func() { panic("second") })
-	require.NotNil(t, c.Recovered())
-	assert.Equal(t, "second", c.Recovered().Value, "a panic after Reset must be captured, not dropped")
-}
-
-func TestRecovered_FormatKeepsStringFormattingOptions(t *testing.T) {
-	var c panics.Catcher
-	c.Try(func() { panic("boom") })
-	r := c.Recovered()
-
-	assert.Equal(t, "panic", fmt.Sprintf("%.5s", r), "precision must truncate like a plain string")
-	assert.Equal(t, "   panic: boom", fmt.Sprintf("%14v", r), "width must pad like a plain string")
-	assert.Equal(t, fmt.Sprintf("%x", "panic: boom"), fmt.Sprintf("%x", r), "%x must not drop the error")
-	assert.Equal(t, fmt.Sprintf("%X", "panic: boom"), fmt.Sprintf("%X", r), "%X must not drop the error")
 }

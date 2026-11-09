@@ -236,9 +236,14 @@ func mapSeq[T, R any](in stditer.Seq[T], fn func(T) R, fnCtx func(context.Contex
 
 				// Push in submission order. If the consumer has already broken,
 				// release the semaphore slot and exit rather than blocking forever.
+				// The output can stay full long after a slot frees up, so a
+				// cancellation that arrives while waiting must also stop dispatch.
 				select {
 				case ordered <- s:
 				case <-done:
+					<-sem
+					return
+				case <-ctx.Done():
 					<-sem
 					return
 				}

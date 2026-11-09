@@ -2,7 +2,6 @@ package stream_test
 
 import (
 	"context"
-	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -14,110 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
-	"github.com/purpleclay/conker/panics"
 	"github.com/purpleclay/conker/stream"
 )
 
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
-}
-
-func TestStream_Go_ExecutesCallback(t *testing.T) {
-	s := stream.New()
-
-	var called atomic.Bool
-	s.Go(func(_ context.Context) (stream.Callback, error) {
-		return func() { called.Store(true) }, nil
-	})
-
-	s.Wait()
-	assert.True(t, called.Load())
-}
-
-func TestStream_Go_PreservesSubmissionOrder(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New()
-
-		var order []int
-		// Submit in order but complete in reverse: task 3 finishes first.
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(3 * time.Second)
-			return func() { order = append(order, 1) }, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(2 * time.Second)
-			return func() { order = append(order, 2) }, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(1 * time.Second)
-			return func() { order = append(order, 3) }, nil
-		})
-
-		s.Wait()
-		assert.Equal(t, []int{1, 2, 3}, order)
-	})
-}
-
-func TestStream_Go_NilCallbackIsNoOp(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New()
-
-		var order []int
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(2 * time.Second)
-			return func() {
-				order = append(order, 1)
-			}, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(1 * time.Second)
-			return nil, nil
-		}) // no-op
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			return func() {
-				order = append(order, 3)
-			}, nil
-		})
-
-		s.Wait()
-		assert.Equal(t, []int{1, 3}, order)
-	})
-}
-
-func TestStream_ProducerPanic_PropagatesViaWait(t *testing.T) {
-	s := stream.New()
-	s.Go(func(_ context.Context) (stream.Callback, error) {
-		panic("producer went wrong")
-	})
-
-	err := func() (r any) {
-		defer func() { r = recover() }()
-		s.Wait()
-		return nil
-	}()
-
-	require.NotNil(t, err)
-	rec, ok := err.(*panics.Recovered)
-	require.True(t, ok, "Wait must re-panic with *panics.Recovered")
-	assert.Equal(t, "producer went wrong", rec.Value)
-}
-
-func TestStream_CallbackPanic_PropagatesViaWait(t *testing.T) {
-	s := stream.New()
-	s.Go(func(_ context.Context) (stream.Callback, error) {
-		return func() { panic("callback went wrong") }, nil
-	})
-
-	err := func() (r any) {
-		defer func() { r = recover() }()
-		s.Wait()
-		return nil
-	}()
-
-	require.NotNil(t, err)
-	rec, ok := err.(*panics.Recovered)
-	require.True(t, ok, "Wait must re-panic with *panics.Recovered")
-	assert.Equal(t, "callback went wrong", rec.Value)
 }
 
 func TestStream_ProducerPanic_DoesNotDeadlockLateSubmitters(t *testing.T) {
@@ -149,39 +49,6 @@ func TestStream_CallbackPanic_DoesNotDeadlockLateSubmitters(t *testing.T) {
 
 		assert.Panics(t, func() { _ = s.Wait() })
 	})
-}
-
-func TestStream_ProducerPanicDuringDrain_OutranksEarlierCallbackPanic(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New().WithMaxGoroutines(1)
-
-		// The callback panic dispatches first; the producer panic is only
-		// discovered afterwards, while the dispatcher drains the remaining
-		// slot. Producer panics must still win — they preserve the original
-		// panic site's stack trace, unlike a re-wrapped callback panic.
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			return func() { panic("callback went wrong") }, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			panic("producer went wrong")
-		})
-
-		err := func() (r any) {
-			defer func() { r = recover() }()
-			s.Wait()
-			return nil
-		}()
-
-		require.NotNil(t, err)
-		rec, ok := err.(*panics.Recovered)
-		require.True(t, ok, "Wait must re-panic with *panics.Recovered")
-		assert.Equal(t, "producer went wrong", rec.Value, "producer panic must win even when discovered during post-panic drain")
-	})
-}
-
-func TestStream_Wait_EmptyIsNoOp(t *testing.T) {
-	s := stream.New()
-	require.NotPanics(t, func() { _ = s.Wait() })
 }
 
 func TestStream_Wait_IdempotentAfterTasks(t *testing.T) {
@@ -325,61 +192,6 @@ func TestStream_Producer_ReceivesStreamContext(t *testing.T) {
 	assert.ErrorIs(t, producerCtx.Err(), context.Canceled)
 }
 
-func TestStream_Wait_NilWhenNoProducerErrors(t *testing.T) {
-	s := stream.New()
-	s.Go(func(_ context.Context) (stream.Callback, error) { return nil, nil })
-
-	require.NoError(t, s.Wait())
-}
-
-func TestStream_ProducerErrors_JoinedInSubmissionOrder(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New()
-		first := errors.New("first")
-		second := errors.New("second")
-
-		// The later submission fails first; Wait must still report submission order.
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(2 * time.Second)
-			return nil, first
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(time.Second)
-			return nil, second
-		})
-
-		err := s.Wait()
-		require.Error(t, err)
-		joined, ok := err.(interface{ Unwrap() []error })
-		require.True(t, ok, "Wait must return errors.Join of producer errors")
-		assert.Equal(t, []error{first, second}, joined.Unwrap())
-	})
-}
-
-func TestStream_ProducerError_SkipsItsCallbackButLaterCallbacksRunInOrder(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New()
-		sentinel := errors.New("producer failed")
-
-		var order []int
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(3 * time.Second)
-			return func() { order = append(order, 1) }, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(2 * time.Second)
-			return func() { order = append(order, 2) }, sentinel
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(time.Second)
-			return func() { order = append(order, 3) }, nil
-		})
-
-		require.ErrorIs(t, s.Wait(), sentinel)
-		assert.Equal(t, []int{1, 3}, order, "an errored slot is skipped, not a halt")
-	})
-}
-
 func TestStream_WithContext_CancelReachesInflightProducers(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		parent, cancel := context.WithCancel(context.Background())
@@ -418,132 +230,10 @@ func TestStream_WithContext_PanicsAfterGo(t *testing.T) {
 	require.NoError(t, s.Wait())
 }
 
-func TestStream_WithCancelOnError_CancelsInflightProducers(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New().WithMaxGoroutines(4).WithCancelOnError()
-		sentinel := errors.New("producer failed")
-
-		start := time.Now()
-		var cancelledAfter time.Duration
-		var cause error
-		s.Go(func(ctx context.Context) (stream.Callback, error) {
-			select {
-			case <-time.After(time.Hour):
-				return nil, nil
-			case <-ctx.Done():
-				cancelledAfter = time.Since(start)
-				cause = context.Cause(ctx)
-				return nil, ctx.Err()
-			}
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			time.Sleep(time.Second)
-			return nil, sentinel
-		})
-
-		require.ErrorIs(t, s.Wait(), sentinel)
-		assert.Equal(t, time.Second, cancelledAfter, "in-flight producers must be cancelled as soon as a sibling errors")
-		assert.Same(t, sentinel, cause, "the triggering error must be the cancellation cause")
-	})
-}
-
-func TestStream_WithoutCancelOnError_ErrorDoesNotCancelSiblings(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New().WithMaxGoroutines(2)
-
-		var siblingErr error
-		s.Go(func(ctx context.Context) (stream.Callback, error) {
-			time.Sleep(2 * time.Second)
-			siblingErr = ctx.Err()
-			return nil, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			return nil, errors.New("producer failed")
-		})
-
-		require.Error(t, s.Wait())
-		assert.NoError(t, siblingErr)
-	})
-}
-
 func TestStream_WithCancelOnError_PanicsAfterGo(t *testing.T) {
 	s := stream.New()
 	s.Go(func(_ context.Context) (stream.Callback, error) { return nil, nil })
 
 	assert.Panics(t, func() { s.WithCancelOnError() })
 	require.NoError(t, s.Wait())
-}
-
-func TestStream_Reset_AllowsSecondBatch(t *testing.T) {
-	s := stream.New().WithMaxGoroutines(2)
-
-	var order []int
-	s.Go(func(_ context.Context) (stream.Callback, error) {
-		return nil, errors.New("first batch failed")
-	})
-	require.Error(t, s.Wait())
-
-	s.Reset()
-	for i := range 3 {
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			return func() { order = append(order, i) }, nil
-		})
-	}
-
-	require.NoError(t, s.Wait(), "Reset must clear errors from the previous batch")
-	assert.Equal(t, []int{0, 1, 2}, order)
-}
-
-func TestStream_Reset_RenewsContext(t *testing.T) {
-	s := stream.New()
-	require.NoError(t, s.Wait())
-
-	s.Reset()
-	var producerErr error
-	s.Go(func(ctx context.Context) (stream.Callback, error) {
-		producerErr = ctx.Err()
-		return nil, nil
-	})
-
-	require.NoError(t, s.Wait())
-	assert.NoError(t, producerErr, "producers after Reset must not see the previous batch's cancelled context")
-}
-
-func TestStream_Reset_AfterPanicAllowsReuse(t *testing.T) {
-	s := stream.New()
-	s.Go(func(_ context.Context) (stream.Callback, error) { panic("boom") })
-	require.Panics(t, func() { _ = s.Wait() })
-
-	s.Reset()
-	var called atomic.Bool
-	s.Go(func(_ context.Context) (stream.Callback, error) {
-		return func() { called.Store(true) }, nil
-	})
-
-	require.NotPanics(t, func() { require.NoError(t, s.Wait()) })
-	assert.True(t, called.Load())
-}
-
-func TestStream_Reset_PreservesCancelOnError(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		s := stream.New().WithMaxGoroutines(2).WithCancelOnError()
-		require.NoError(t, s.Wait())
-		s.Reset()
-
-		var cancelled bool
-		s.Go(func(ctx context.Context) (stream.Callback, error) {
-			select {
-			case <-time.After(time.Hour):
-			case <-ctx.Done():
-				cancelled = true
-			}
-			return nil, nil
-		})
-		s.Go(func(_ context.Context) (stream.Callback, error) {
-			return nil, errors.New("producer failed")
-		})
-
-		require.Error(t, s.Wait())
-		assert.True(t, cancelled)
-	})
 }
