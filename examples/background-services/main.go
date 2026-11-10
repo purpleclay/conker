@@ -97,7 +97,7 @@ func main() {
 
 // metricsReporter logs a running counter every tick, and stops as soon as
 // ctx is cancelled.
-func metricsReporter(ctx context.Context) {
+func metricsReporter(ctx context.Context) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -106,7 +106,7 @@ func metricsReporter(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			slog.Info("metrics: stopped", "ticks", count)
-			return
+			return nil
 		case <-ticker.C:
 			count++
 			slog.Info("metrics: tick", "count", count)
@@ -117,7 +117,7 @@ func metricsReporter(ctx context.Context) {
 // cacheRefresher refreshes a cache every tick. ~15% of refreshes hit a
 // corrupted snapshot and panic — daemon.Pool recovers this and reports it
 // from Stop, but the other daemons are unaffected.
-func cacheRefresher(ctx context.Context) {
+func cacheRefresher(ctx context.Context) error {
 	ticker := time.NewTicker(700 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -125,7 +125,7 @@ func cacheRefresher(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			slog.Info("cache-refresher: stopped")
-			return
+			return nil
 		case <-ticker.C:
 			if rand.IntN(100) < 15 {
 				panic(errCacheCorrupt)
@@ -137,8 +137,8 @@ func cacheRefresher(ctx context.Context) {
 
 // connectionDrainer waits for shutdown, then drains in-flight connections.
 // With slow set, draining takes longer than -shutdown-timeout.
-func connectionDrainer(slow bool) func(context.Context) {
-	return func(ctx context.Context) {
+func connectionDrainer(slow bool) func(context.Context) error {
+	return func(ctx context.Context) error {
 		<-ctx.Done()
 
 		drain := 300 * time.Millisecond
@@ -149,5 +149,6 @@ func connectionDrainer(slow bool) func(context.Context) {
 		slog.Info("connection-drainer: draining in-flight connections", "estimated", drain)
 		time.Sleep(drain)
 		slog.Info("connection-drainer: drained")
+		return nil
 	}
 }
