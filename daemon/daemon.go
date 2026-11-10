@@ -16,13 +16,15 @@ import (
 // Example:
 //
 //	d := daemon.New(ctx)
-//	d.Spawn(func(ctx context.Context) {
+//	d.Spawn(func(ctx context.Context) error {
 //	    for {
 //	        select {
 //	        case <-ctx.Done():
-//	            return
+//	            return nil
 //	        case job := <-jobs:
-//	            process(job)
+//	            if err := process(job); err != nil {
+//	                return err
+//	            }
 //	        }
 //	    }
 //	})
@@ -49,19 +51,22 @@ func New(ctx context.Context) *Pool {
 // Spawn starts a long-lived worker. fn must observe ctx.Done() and return
 // promptly once it fires.
 //
+// A worker that fails returns a non-nil error, which [Pool.Stop] returns. It
+// does not cancel the other daemons, and the worker is not restarted. Return
+// nil on a clean shutdown: returning ctx.Err() reports the shutdown itself
+// as an error from Stop.
+//
 // Spawn returns immediately; the worker runs in its own goroutine. It is safe
 // to call Spawn from within a running daemon — [Pool.Stop] waits for the
 // transitive closure of all spawned daemons.
-func (d *Pool) Spawn(fn func(context.Context)) {
-	d.pool.Go(func(ctx context.Context) error {
-		fn(ctx)
-		return nil
-	})
+func (d *Pool) Spawn(fn func(context.Context) error) {
+	d.pool.Go(fn)
 }
 
 // Stop cancels the context passed to every daemon and waits for them all to
-// return, bounded by ctx. Any panics recovered from daemons are returned as
-// [errors.Join] of *[panics.Recovered] values.
+// return, bounded by ctx. The errors daemons returned, and any panics
+// recovered from them as *[panics.Recovered] values, are returned joined
+// with [errors.Join].
 //
 // If ctx is cancelled before all daemons return, Stop returns ctx.Err();
 // daemons continue running in the background until they observe cancellation.
