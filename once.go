@@ -1,12 +1,19 @@
 package conker
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/purpleclay/conker/panics"
+)
 
 // OnceErr returns a function that invokes fn at most once, no matter how many
 // goroutines call the returned function, and how often. Every caller receives
 // the same (T, error) pair produced by that single call.
 //
-// It is the error-returning equivalent of [sync.OnceValue].
+// If fn panics, the panic is recovered and every caller, including the first,
+// receives the zero value of T and the same [*panics.Recovered] as the error,
+// which matches [panics.ErrPanic] through [errors.Is]. This is where it
+// differs from [sync.OnceValues], which re-panics on every call.
 //
 // Example:
 //
@@ -23,7 +30,14 @@ func OnceErr[T any](fn func() (T, error)) func() (T, error) {
 		err  error
 	)
 	return func() (T, error) {
-		once.Do(func() { val, err = fn() })
+		once.Do(func() {
+			var pc panics.Catcher
+			pc.Try(func() { val, err = fn() })
+			if r := pc.Recovered(); r != nil {
+				var zero T
+				val, err = zero, r
+			}
+		})
 		return val, err
 	}
 }

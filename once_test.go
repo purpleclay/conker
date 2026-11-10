@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/purpleclay/conker"
+	"github.com/purpleclay/conker/panics"
 )
 
 func TestOnceErr_CallsFnAtMostOnce(t *testing.T) {
@@ -66,5 +67,60 @@ func TestOnceErr_ConcurrentCallers_CallFnOnceAndShareResult(t *testing.T) {
 	}
 	wg.Wait()
 
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestOnceErr_PanicReturnedAsErrorToEveryCaller(t *testing.T) {
+	var calls atomic.Int32
+	once := conker.OnceErr(func() (*int, error) {
+		calls.Add(1)
+		panic("boom")
+	})
+
+	var first error
+	for i := range 3 {
+		var (
+			val *int
+			err error
+		)
+		require.NotPanics(t, func() { val, err = once() })
+		assert.Nil(t, val)
+		require.ErrorIs(t, err, panics.ErrPanic)
+
+		var rec *panics.Recovered
+		require.ErrorAs(t, err, &rec)
+		assert.Equal(t, "boom", rec.Value)
+
+		if i == 0 {
+			first = err
+		}
+		assert.Same(t, first, err)
+	}
+
+	assert.Equal(t, int32(1), calls.Load())
+}
+
+func TestOnceErr_ConcurrentCallers_ShareRecoveredPanic(t *testing.T) {
+	var calls atomic.Int32
+	once := conker.OnceErr(func() (int, error) {
+		calls.Add(1)
+		panic("boom")
+	})
+
+	const n = 50
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			assert.NotPanics(t, func() { _, errs[i] = once() })
+		})
+	}
+	wg.Wait()
+
+	var rec *panics.Recovered
+	require.ErrorAs(t, errs[0], &rec)
+	for _, err := range errs {
+		assert.Same(t, rec, err)
+	}
 	assert.Equal(t, int32(1), calls.Load())
 }
