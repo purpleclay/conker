@@ -521,3 +521,137 @@ func TestInputPanic_CancelsInflightFnContexts(t *testing.T) {
 		})
 	}
 }
+
+var errBody = errors.New("range body panics")
+
+// countUp yields 0, 1, 2, ... until the consumer stops.
+var countUp stditer.Seq[int] = func(yield func(int) bool) {
+	for i := 0; ; i++ {
+		if !yield(i) {
+			return
+		}
+	}
+}
+
+// bodyCases ranges each lazy Map function over an endless input and calls
+// body with every value it yields.
+func bodyCases(fn func(context.Context, int) int, body func(int)) map[string]func() {
+	opt := conkiter.WithMaxGoroutines(2)
+	bg := context.Background()
+	pairs := func(yield func(int, int) bool) {
+		for v := range countUp {
+			if !yield(v, v) {
+				return
+			}
+		}
+	}
+	return map[string]func(){
+		"MapSeq": func() {
+			for v := range conkiter.MapSeq(countUp, func(v int) int { return fn(bg, v) }, opt) {
+				body(v)
+			}
+		},
+		"MapSeqCtx": func() {
+			for v := range conkiter.MapSeqCtx(countUp, fn, opt) {
+				body(v)
+			}
+		},
+		"MapSeq2": func() {
+			for v := range conkiter.MapSeq2(pairs, func(_, v int) int { return fn(bg, v) }, opt) {
+				body(v)
+			}
+		},
+		"MapSeq2Ctx": func() {
+			for v := range conkiter.MapSeq2Ctx(pairs, func(ctx context.Context, _, v int) int { return fn(ctx, v) }, opt) {
+				body(v)
+			}
+		},
+	}
+}
+
+func TestBodyExit_StopsDispatchAndWaitsForInflightWork(t *testing.T) {
+	var started, ended, inflight atomic.Int32
+	fn := func(_ context.Context, v int) int {
+		started.Add(1)
+		defer ended.Add(1)
+		time.Sleep(time.Second)
+		return v
+	}
+	// exitAt lets the dispatcher fill every slot, then leaves the range body
+	// with exit.
+	exitAt := func(exit func()) func(int) {
+		return func(v int) {
+			if v == 2 {
+				synctest.Wait()
+				inflight.Store(started.Load() - ended.Load())
+				exit()
+			}
+		}
+	}
+	exits := map[string]func(){
+		"panic":  func() { panic(errBody) },
+		"Goexit": runtime.Goexit,
+	}
+
+	for exitName, exit := range exits {
+		for name, call := range bodyCases(fn, exitAt(exit)) {
+			t.Run(exitName+"/"+name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					started.Store(0)
+					ended.Store(0)
+
+					var v any
+					exited := make(chan struct{})
+					go func() {
+						defer close(exited)
+						v = recoverFrom(call)
+					}()
+					<-exited
+
+					require.Positive(t, inflight.Load(), "fn calls must be in flight when the body exits")
+					assert.Equal(t, started.Load(), ended.Load(), "in-flight fn calls must return before the body's exit leaves the loop")
+					if exitName == "panic" {
+						assert.Equal(t, errBody, v, "the body's panic must reach the caller unchanged")
+					}
+
+					// The bubble fails if the dispatcher is still blocked here.
+					startedAtExit := started.Load()
+					time.Sleep(time.Minute)
+					assert.Equal(t, startedAtExit, started.Load(), "no fn call may start after the body exits")
+				})
+			})
+		}
+	}
+}
+
+func TestBodyPanic_CancelsInflightFnContexts(t *testing.T) {
+	var started, sawCancel atomic.Int32
+	fn := func(ctx context.Context, v int) int {
+		if v == 0 {
+			return v
+		}
+		started.Add(1)
+		if awaitCancel(ctx) {
+			sawCancel.Add(1)
+		}
+		return v
+	}
+	body := func(int) {
+		synctest.Wait() // every slot holds a call blocked on its context
+		panic(errBody)
+	}
+
+	cases := bodyCases(fn, body)
+	for _, name := range []string{"MapSeqCtx", "MapSeq2Ctx"} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				started.Store(0)
+				sawCancel.Store(0)
+
+				assert.Equal(t, errBody, recoverFrom(cases[name]))
+				require.Positive(t, started.Load())
+				assert.Equal(t, started.Load(), sawCancel.Load(), "every in-flight fn context must be cancelled")
+			})
+		})
+	}
+}

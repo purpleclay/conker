@@ -77,6 +77,8 @@ const inputPanics = -1
 
 const inputPanicValue = "input sequence panics"
 
+const bodyPanicValue = "range body panics"
+
 func values(in []int) stditer.Seq[int] {
 	return func(yield func(int) bool) {
 		for _, v := range in {
@@ -206,6 +208,7 @@ type iterPlan struct {
 	preCancel     bool // cancel the parent context before the call
 	cancelAt      int  // element whose fn cancels the parent context as it starts; -1 for none
 	breakAfter    int  // lazy variants: stop ranging after this many results; 0 for never
+	bodyPanics    bool // lazy variants: stop ranging by panicking in the range body, not breaking
 	inputPanicAt  int  // seqInput variants: the input panics after yielding this many elements; -1 for never
 	elems         []elem
 }
@@ -243,6 +246,7 @@ func drawIterPlan(t *rapid.T) iterPlan {
 		}
 		if p.variant.seq != nil {
 			p.breakAfter = rapid.IntRange(0, n).Draw(t, "breakAfter")
+			p.bodyPanics = p.breakAfter > 0 && rapid.Bool().Draw(t, "bodyPanics")
 		}
 	}
 	if p.variant.seqInput && !p.preCancel && rapid.Bool().Draw(t, "inputPanics") {
@@ -328,6 +332,9 @@ func runIterPlan(t *testing.T, plan iterPlan) iterObs {
 				o.results = append(o.results, r)
 				if len(o.results) == plan.breakAfter {
 					o.brokeAt = time.Since(start)
+					if plan.bodyPanics {
+						panic(bodyPanicValue)
+					}
 					break
 				}
 			}
@@ -434,7 +441,11 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 		return // no results or errors to check
 	}
 
-	if !plan.variant.errs {
+	if plan.bodyPanics && o.brokeAt >= 0 {
+		if o.recovered != bodyPanicValue {
+			t.Fatalf("the range body panicked, but %s panicked with %v", plan.variant.name, o.recovered)
+		}
+	} else if !plan.variant.errs {
 		if len(panickedElems) == 0 {
 			if o.recovered != nil {
 				t.Fatalf("unexpected panic %v", o.recovered)
@@ -509,7 +520,8 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 }
 
 // TestIter_Property drives every iter function through random inputs,
-// concurrency limits, failures, panics, parent cancellation, and early breaks.
+// concurrency limits, failures, panics, parent cancellation, and early breaks
+// or panics in the range body.
 // It checks that elements are dispatched in input order and never after a stop
 // signal, that results and ElemErrors line up with the elements that ran, that
 // panics in fn or in the input re-surface, and that the concurrency limit
