@@ -22,4 +22,12 @@
 // Panics in fn are always recovered. Err functions return them as
 // *[panics.Recovered] errors; the others stop dispatch and re-panic in the
 // caller's goroutine once in-flight work has finished.
+//
+// A panic in the input sequence also reaches the caller. The Map functions
+// range the input on a goroutine of their own, so they recover it, stop
+// dispatch and re-panic it in the caller's goroutine as a
+// *[panics.Recovered] once in-flight work has finished. [MapSeqErr] does the
+// same rather than return an error, because the panic belongs to no element.
+// The ForEach functions range the input in the caller's goroutine, so the
+// panic propagates unchanged.
 package iter

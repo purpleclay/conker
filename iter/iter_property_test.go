@@ -39,8 +39,11 @@ type variant struct {
 	results resultOrder
 	errs    bool // an Err variant: failures and panics are returned as errors
 	inMap   bool // iterates a map, so dispatch order is not input order
-	run     func([]int, elemFn, []conkiter.Option) ([]int, error)
-	seq     func([]int, elemFn, []conkiter.Option) stditer.Seq[int] // set for lazy variants
+	// seqInput is set for variants that range a sequence the caller supplies
+	// on a goroutine of their own, so the plan can make that sequence panic.
+	seqInput bool
+	run      func([]int, elemFn, []conkiter.Option) ([]int, error)
+	seq      func([]int, elemFn, []conkiter.Option) stditer.Seq[int] // set for lazy variants
 }
 
 func plain(fn elemFn) func(int) int {
@@ -68,9 +71,31 @@ func sameKey(k, v int) int {
 	return k
 }
 
+// inputPanics is an input element that makes the input sequence panic with
+// inputPanicValue instead of yielding.
+const inputPanics = -1
+
+const inputPanicValue = "input sequence panics"
+
+func values(in []int) stditer.Seq[int] {
+	return func(yield func(int) bool) {
+		for _, v := range in {
+			if v == inputPanics {
+				panic(inputPanicValue)
+			}
+			if !yield(v) {
+				return
+			}
+		}
+	}
+}
+
 func pairs(in []int) stditer.Seq2[int, int] {
 	return func(yield func(int, int) bool) {
 		for _, k := range in {
+			if k == inputPanics {
+				panic(inputPanicValue)
+			}
 			if !yield(k, pairValue(k)) {
 				return
 			}
@@ -88,9 +113,10 @@ func asMap(in []int) map[int]int {
 
 func lazy(name string, seq func([]int, elemFn, []conkiter.Option) stditer.Seq[int]) variant {
 	return variant{
-		name:    name,
-		results: inputOrder,
-		seq:     seq,
+		name:     name,
+		results:  inputOrder,
+		seqInput: true,
+		seq:      seq,
 		run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
 			return slices.Collect(seq(in, fn, o)), nil
 		},
@@ -107,14 +133,14 @@ var variants = []variant{
 	{name: "MapErr", results: inputOrder, errs: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
 		return conkiter.MapErr(in, fn, o...)
 	}},
-	{name: "MapSeqErr", results: inputOrder, errs: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
-		return conkiter.MapSeqErr(slices.Values(in), fn, o...)
+	{name: "MapSeqErr", results: inputOrder, errs: true, seqInput: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
+		return conkiter.MapSeqErr(values(in), fn, o...)
 	}},
 	lazy("MapSeq", func(in []int, fn elemFn, o []conkiter.Option) stditer.Seq[int] {
-		return conkiter.MapSeq(slices.Values(in), plain(fn), o...)
+		return conkiter.MapSeq(values(in), plain(fn), o...)
 	}),
 	lazy("MapSeqCtx", func(in []int, fn elemFn, o []conkiter.Option) stditer.Seq[int] {
-		return conkiter.MapSeqCtx(slices.Values(in), withCtx(fn), o...)
+		return conkiter.MapSeqCtx(values(in), withCtx(fn), o...)
 	}),
 	lazy("MapSeq2", func(in []int, fn elemFn, o []conkiter.Option) stditer.Seq[int] {
 		return conkiter.MapSeq2(pairs(in), func(k, v int) int { return plain(fn)(sameKey(k, v)) }, o...)
@@ -180,6 +206,7 @@ type iterPlan struct {
 	preCancel     bool // cancel the parent context before the call
 	cancelAt      int  // element whose fn cancels the parent context as it starts; -1 for none
 	breakAfter    int  // lazy variants: stop ranging after this many results; 0 for never
+	inputPanicAt  int  // seqInput variants: the input panics after yielding this many elements; -1 for never
 	elems         []elem
 }
 
@@ -193,6 +220,7 @@ func drawIterPlan(t *rapid.T) iterPlan {
 		variant:       rapid.SampledFrom(variants).Draw(t, "variant"),
 		maxGoroutines: rapid.IntRange(1, 4).Draw(t, "maxGoroutines"),
 		cancelAt:      -1,
+		inputPanicAt:  -1,
 	}
 	outcomes := []outcome{succeed, succeed, succeed, panicked}
 	if p.variant.errs {
@@ -216,6 +244,9 @@ func drawIterPlan(t *rapid.T) iterPlan {
 		if p.variant.seq != nil {
 			p.breakAfter = rapid.IntRange(0, n).Draw(t, "breakAfter")
 		}
+	}
+	if p.variant.seqInput && !p.preCancel && rapid.Bool().Draw(t, "inputPanics") {
+		p.inputPanicAt = rapid.IntRange(0, len(p.elems)).Draw(t, "inputPanicAt")
 	}
 	return p
 }
@@ -277,6 +308,9 @@ func runIterPlan(t *testing.T, plan iterPlan) iterObs {
 		for i := range in {
 			in[i] = i
 		}
+		if plan.inputPanicAt >= 0 {
+			in = append(in[:plan.inputPanicAt], inputPanics)
+		}
 		if plan.preCancel {
 			cancel()
 		}
@@ -324,6 +358,23 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 		}
 	}
 
+	// The call may re-panic with the input's panic only once the input has
+	// yielded every element before it, and each of those has been dispatched.
+	r, _ := o.recovered.(*panics.Recovered)
+	inputRepanicked := r != nil && r.Value == inputPanicValue
+	if inputRepanicked {
+		if plan.inputPanicAt < 0 {
+			t.Fatalf("re-panicked with the input's panic, but the input does not panic")
+		}
+		if len(dispatched) != plan.inputPanicAt {
+			t.Fatalf("the input panicked after %d elements, but %d were dispatched", plan.inputPanicAt, len(dispatched))
+		}
+	}
+	yielded := n // elements the input yields before it panics or ends
+	if plan.inputPanicAt >= 0 {
+		yielded = plan.inputPanicAt
+	}
+
 	if plan.preCancel {
 		if len(dispatched) > 0 || len(o.results) > 0 || o.err != nil || o.recovered != nil {
 			t.Fatalf("with a cancelled context: dispatched %v, results %v, error %v, panic %v; want nothing", dispatched, o.results, o.err, o.recovered)
@@ -360,8 +411,11 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 	if o.brokeAt >= 0 {
 		stop(o.brokeAt)
 	}
-	if stopAt < 0 && len(dispatched) != n {
-		t.Fatalf("dispatched %d of %d elements with nothing to stop dispatch", len(dispatched), n)
+	if stopAt < 0 && len(dispatched) != yielded {
+		t.Fatalf("dispatched %d of %d elements with nothing to stop dispatch", len(dispatched), yielded)
+	}
+	if stopAt < 0 && plan.inputPanicAt >= 0 && !inputRepanicked {
+		t.Fatalf("the input panicked with nothing to stop dispatch first, but %s did not re-panic it", plan.variant.name)
 	}
 	for _, i := range dispatched {
 		if stopAt >= 0 && o.starts[i][0] > stopAt {
@@ -372,8 +426,12 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 	if o.peak > plan.maxGoroutines {
 		t.Fatalf("peak concurrency %d exceeds limit %d", o.peak, plan.maxGoroutines)
 	}
-	if want := min(n, plan.maxGoroutines); plan.cancelAt < 0 && o.peak < want {
+	if want := min(yielded, plan.maxGoroutines); plan.cancelAt < 0 && o.peak < want {
 		t.Fatalf("peak concurrency %d, want %d", o.peak, want)
+	}
+
+	if inputRepanicked {
+		return // no results or errors to check
 	}
 
 	if !plan.variant.errs {
@@ -454,7 +512,8 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 // concurrency limits, failures, panics, parent cancellation, and early breaks.
 // It checks that elements are dispatched in input order and never after a stop
 // signal, that results and ElemErrors line up with the elements that ran, that
-// panics re-surface, and that the concurrency limit holds and is reached.
+// panics in fn or in the input re-surface, and that the concurrency limit
+// holds and is reached.
 func TestIter_Property(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		plan := drawIterPlan(rt)

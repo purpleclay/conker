@@ -120,6 +120,10 @@ func (e *ElemError) Unwrap() error { return e.Err }
 // being dispatched; in-flight mapping goroutines are not interrupted.
 // Use [MapSeqCtx] when fn needs to observe cancellation.
 //
+// A panic in fn, or in the input sequence, stops dispatch and is re-panicked
+// in the caller's goroutine as a *[panics.Recovered] once in-flight calls
+// have returned.
+//
 // Example:
 //
 //	doubled := iter.MapSeq(slices.Values(nums), func(n int) int { return n * 2 })
@@ -135,7 +139,7 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 //
 // The context is derived from the one provided via [WithContext] and is
 // cancelled when that context is cancelled, when the caller breaks out of the
-// range, or when any fn call panics. Breaking out of the range still waits
+// range, or when fn or the input sequence panics. Breaking out of the range still waits
 // for in-flight calls to return, so fn should observe ctx.Done() to return
 // promptly.
 //
@@ -216,45 +220,52 @@ func mapSeq[T, R any](in stditer.Seq[T], fn func(T) R, fnCtx func(context.Contex
 					return pc.Recovered() != nil
 				}
 			}
-			for v := range in {
-				if stopped() {
-					return
-				}
-				select {
-				case sem <- struct{}{}:
-				case <-done:
-					return
-				case <-ctx.Done():
-					return
-				}
-				if stopped() {
-					<-sem
-					return
-				}
-
-				s := &mapSlot[R]{done: make(chan struct{})}
-
-				// Push in submission order. If the consumer has already broken,
-				// release the semaphore slot and exit rather than blocking forever.
-				// The output can stay full long after a slot frees up, so a
-				// cancellation that arrives while waiting must also stop dispatch.
-				select {
-				case ordered <- s:
-				case <-done:
-					<-sem
-					return
-				case <-ctx.Done():
-					<-sem
-					return
-				}
-
-				go func(r *mapRun[T, R], v T, s *mapSlot[R]) {
-					defer func() { <-r.sem; close(s.done) }()
-					r.pc.Try(func() { r.call(v, s) })
-					if r.pc.Recovered() != nil {
-						r.cancel() // stop in-flight siblings as well as dispatch
+			// The input is user code like fn: catch a panic in it the same way,
+			// so the consumer loop below re-panics it in the caller's goroutine.
+			pc.Try(func() {
+				for v := range in {
+					if stopped() {
+						return
 					}
-				}(r, v, s)
+					select {
+					case sem <- struct{}{}:
+					case <-done:
+						return
+					case <-ctx.Done():
+						return
+					}
+					if stopped() {
+						<-sem
+						return
+					}
+
+					s := &mapSlot[R]{done: make(chan struct{})}
+
+					// Push in submission order. If the consumer has already broken,
+					// release the semaphore slot and exit rather than blocking forever.
+					// The output can stay full long after a slot frees up, so a
+					// cancellation that arrives while waiting must also stop dispatch.
+					select {
+					case ordered <- s:
+					case <-done:
+						<-sem
+						return
+					case <-ctx.Done():
+						<-sem
+						return
+					}
+
+					go func(r *mapRun[T, R], v T, s *mapSlot[R]) {
+						defer func() { <-r.sem; close(s.done) }()
+						r.pc.Try(func() { r.call(v, s) })
+						if r.pc.Recovered() != nil {
+							r.cancel() // stop in-flight siblings as well as dispatch
+						}
+					}(r, v, s)
+				}
+			})
+			if pc.Recovered() != nil {
+				r.cancel() // stop in-flight fn calls, as for an fn panic
 			}
 		}()
 
@@ -299,6 +310,10 @@ func mapSeq[T, R any](in stditer.Seq[T], fn func(T) R, fnCtx func(context.Contex
 // being dispatched; in-flight mapping goroutines are not interrupted.
 // Use [MapSeq2Ctx] when fn needs to observe cancellation.
 //
+// A panic in fn, or in the input sequence, stops dispatch and is re-panicked
+// in the caller's goroutine as a *[panics.Recovered] once in-flight calls
+// have returned.
+//
 // Example:
 //
 //	sizes := iter.MapSeq2(maps.All(m), func(k string, v []byte) int { return len(v) })
@@ -322,7 +337,7 @@ func MapSeq2[K, V, R any](in stditer.Seq2[K, V], fn func(K, V) R, options ...Opt
 // MapSeq2Ctx is [MapSeq2] with a context passed into each fn call. The
 // context is cancelled on the same conditions as [MapSeqCtx]: when the
 // [WithContext] context is cancelled, the caller breaks out of the range, or
-// any fn call panics.
+// fn or the input sequence panics.
 func MapSeq2Ctx[K, V, R any](in stditer.Seq2[K, V], fn func(context.Context, K, V) R, options ...Option) stditer.Seq[R] {
 	return MapSeqCtx(
 		func(yield func(kvPair[K, V]) bool) {
@@ -537,6 +552,10 @@ func ForEachMapCtx[K comparable, V any](in map[K]V, fn func(context.Context, K, 
 // dispatched elements, in order. Skipped elements are not reported as errors;
 // check the context's Err to detect cancellation.
 //
+// A panic in the input sequence belongs to no element, so it is not returned
+// as an error. It cancels in-flight fn calls and is re-panicked in the
+// caller's goroutine as a *[panics.Recovered] once they have returned.
+//
 // Example:
 //
 //	pages, err := iter.MapSeqErr(slices.Values(urls), func(ctx context.Context, url string) ([]byte, error) {
@@ -552,6 +571,10 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 	sem := make(chan struct{}, o.maxGoroutines)
 	var mu sync.Mutex
 	var errs []*ElemError
+	// inputPanic catches a panic in the input sequence. A panic in fn becomes an
+	// ElemError, but one in the input belongs to no element, so it is
+	// re-panicked in the caller's goroutine once in-flight work has returned.
+	var inputPanic panics.Catcher
 
 	go func() {
 		defer close(ordered)
@@ -564,48 +587,53 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 			}
 		}
 		var i int
-		for v := range in {
-			idx := i
-			i++
-			if stopped() {
-				return
-			}
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			if stopped() {
-				<-sem
-				return
-			}
-			s := &mapSlot[R]{done: make(chan struct{})}
-			select {
-			case ordered <- s:
-			case <-ctx.Done():
-				<-sem
-				return
-			}
-			go func(idx int, v T, s *mapSlot[R]) {
-				defer func() { <-sem; close(s.done) }()
-				var pc panics.Catcher
-				var r R
-				var err error
-				pc.Try(func() { r, err = fn(ctx, v) })
-				if rec := pc.Recovered(); rec != nil {
-					err = rec
-				}
-				if err != nil {
-					mu.Lock()
-					errs = append(errs, &ElemError{Index: idx, Err: err})
-					mu.Unlock()
-					if o.cancelOnError {
-						cancel()
-					}
+		inputPanic.Try(func() {
+			for v := range in {
+				idx := i
+				i++
+				if stopped() {
 					return
 				}
-				s.val = r
-			}(idx, v, s)
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				if stopped() {
+					<-sem
+					return
+				}
+				s := &mapSlot[R]{done: make(chan struct{})}
+				select {
+				case ordered <- s:
+				case <-ctx.Done():
+					<-sem
+					return
+				}
+				go func(idx int, v T, s *mapSlot[R]) {
+					defer func() { <-sem; close(s.done) }()
+					var pc panics.Catcher
+					var r R
+					var err error
+					pc.Try(func() { r, err = fn(ctx, v) })
+					if rec := pc.Recovered(); rec != nil {
+						err = rec
+					}
+					if err != nil {
+						mu.Lock()
+						errs = append(errs, &ElemError{Index: idx, Err: err})
+						mu.Unlock()
+						if o.cancelOnError {
+							cancel()
+						}
+						return
+					}
+					s.val = r
+				}(idx, v, s)
+			}
+		})
+		if inputPanic.Recovered() != nil {
+			cancel()
 		}
 	}()
 
@@ -614,6 +642,7 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 		<-s.done
 		out = append(out, s.val)
 	}
+	inputPanic.Repanic()
 
 	slices.SortFunc(errs, func(a, b *ElemError) int { return a.Index - b.Index })
 	joined := make([]error, len(errs))
