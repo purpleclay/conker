@@ -414,3 +414,110 @@ func TestForEachCtx_WithContext_CancelReachesInflightFn(t *testing.T) {
 		assert.Equal(t, int64(2), observed.Load())
 	})
 }
+
+var errInput = errors.New("input sequence panics")
+
+// panickingInput yields 0 to n-1, then panics with errInput.
+func panickingInput(n int) stditer.Seq[int] {
+	return func(yield func(int) bool) {
+		for i := range n {
+			if !yield(i) {
+				return
+			}
+		}
+		panic(errInput)
+	}
+}
+
+func panickingInput2(n int) stditer.Seq2[int, int] {
+	return func(yield func(int, int) bool) {
+		for v := range panickingInput(n) {
+			if !yield(v, v) {
+				return
+			}
+		}
+	}
+}
+
+// inputPanicCases calls each function that ranges its input on a goroutine
+// of its own, over an input that panics after n elements.
+func inputPanicCases(n int, fn func(context.Context, int) int) map[string]func() {
+	opt := conkiter.WithMaxGoroutines(2)
+	bg := context.Background()
+	return map[string]func(){
+		"MapSeq": func() {
+			_ = slices.Collect(conkiter.MapSeq(panickingInput(n), func(v int) int { return fn(bg, v) }, opt))
+		},
+		"MapSeqCtx": func() {
+			_ = slices.Collect(conkiter.MapSeqCtx(panickingInput(n), fn, opt))
+		},
+		"MapSeq2": func() {
+			_ = slices.Collect(conkiter.MapSeq2(panickingInput2(n), func(_, v int) int { return fn(bg, v) }, opt))
+		},
+		"MapSeq2Ctx": func() {
+			_ = slices.Collect(conkiter.MapSeq2Ctx(panickingInput2(n), func(ctx context.Context, _, v int) int { return fn(ctx, v) }, opt))
+		},
+		"MapSeqErr": func() {
+			_, _ = conkiter.MapSeqErr(panickingInput(n), func(ctx context.Context, v int) (int, error) { return fn(ctx, v), nil }, opt)
+		},
+	}
+}
+
+func recoverFrom(call func()) (val any) {
+	defer func() { val = recover() }()
+	call()
+	return nil
+}
+
+func TestInputPanic_RePanicsInCallerAfterInflightWork(t *testing.T) {
+	var started, ended atomic.Int32
+	fn := func(_ context.Context, v int) int {
+		started.Add(1)
+		defer ended.Add(1)
+		time.Sleep(time.Second)
+		return v
+	}
+
+	for name, call := range inputPanicCases(3, fn) {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				started.Store(0)
+				ended.Store(0)
+
+				v := recoverFrom(call)
+
+				r, ok := v.(*panics.Recovered)
+				require.True(t, ok, "want a *panics.Recovered in the caller, got %T", v)
+				assert.ErrorIs(t, r, panics.ErrPanic)
+				assert.ErrorIs(t, r, errInput)
+				assert.Contains(t, string(r.Stack), "panickingInput", "the stack must point at the input sequence")
+				assert.Equal(t, started.Load(), ended.Load(), "in-flight fn calls must return before the panic reaches the caller")
+			})
+		})
+	}
+}
+
+func TestInputPanic_CancelsInflightFnContexts(t *testing.T) {
+	var sawCancel atomic.Int32
+	fn := func(ctx context.Context, v int) int {
+		if awaitCancel(ctx) {
+			sawCancel.Add(1)
+		}
+		return v
+	}
+
+	// Two elements, both in flight when the input panics: a third would wait
+	// for a slot that only cancellation frees.
+	cases := inputPanicCases(2, fn)
+	for _, name := range []string{"MapSeqCtx", "MapSeq2Ctx", "MapSeqErr"} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				sawCancel.Store(0)
+
+				_, ok := recoverFrom(cases[name]).(*panics.Recovered)
+				require.True(t, ok)
+				assert.Equal(t, int32(2), sawCancel.Load(), "both in-flight fn contexts must be cancelled")
+			})
+		})
+	}
+}
