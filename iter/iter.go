@@ -373,6 +373,9 @@ func MapSeq2Ctx[K, V, R any](in stditer.Seq2[K, V], fn func(context.Context, K, 
 // dispatched are skipped.
 // Use [ForEachSeqCtx] when fn needs to observe cancellation.
 //
+// A panic in the input sequence stops dispatch and propagates unchanged once
+// in-flight calls have returned.
+//
 // Example:
 //
 //	iter.ForEachSeq(slices.Values(items), func(item Item) {
@@ -385,7 +388,8 @@ func ForEachSeq[T any](in stditer.Seq[T], fn func(T), options ...Option) {
 // ForEachSeqCtx is [ForEachSeq] with a context passed into each fn call, so
 // in-flight work can observe cancellation rather than only stopping dispatch.
 // The context is derived from the one provided via [WithContext] and is
-// cancelled when that context is cancelled or when any fn call panics.
+// cancelled when that context is cancelled or when any fn call panics, and
+// before waiting for in-flight calls when the input sequence panics.
 //
 // Example:
 //
@@ -436,6 +440,15 @@ func forEachSeq[T any](in stditer.Seq[T], fn func(T), fnCtx func(context.Context
 
 	ctx, sem, pc := r.ctx, r.sem, &r.pc
 	var wg sync.WaitGroup
+	// A panic in the input skips the wait below. Cancel first so a call
+	// waiting on its context returns, and let the panic go once all have.
+	waited := false
+	defer func() {
+		if !waited {
+			r.cancel()
+			wg.Wait()
+		}
+	}()
 
 	// stopped returns true without blocking if the context has been cancelled
 	// or fn has panicked. Used before and after acquiring the semaphore to
@@ -473,6 +486,7 @@ outer:
 		})
 	}
 	wg.Wait()
+	waited = true
 	pc.Repanic()
 }
 
@@ -682,6 +696,10 @@ func MapSeqErr[T, R any](in stditer.Seq[T], fn func(context.Context, T) (R, erro
 // Elements skipped when dispatch stops early for either reason are not
 // reported as errors; check the context's Err to detect cancellation.
 //
+// A panic in the input sequence cancels the context of in-flight calls and
+// propagates unchanged once they have returned. Errors from those calls are
+// dropped.
+//
 // Example:
 //
 //	err := iter.ForEachSeqErr(slices.Values(items), func(ctx context.Context, item Item) error {
@@ -695,6 +713,14 @@ func ForEachSeqErr[T any](in stditer.Seq[T], fn func(context.Context, T) error, 
 
 	sem := make(chan struct{}, o.maxGoroutines)
 	var wg sync.WaitGroup
+	// As in forEachSeq: a panic in the input must not skip the wait.
+	waited := false
+	defer func() {
+		if !waited {
+			cancel()
+			wg.Wait()
+		}
+	}()
 	var mu sync.Mutex
 	var errs []*ElemError
 
@@ -743,6 +769,7 @@ outer:
 		})
 	}
 	wg.Wait()
+	waited = true
 
 	slices.SortFunc(errs, func(a, b *ElemError) int { return a.Index - b.Index })
 	joined := make([]error, len(errs))
