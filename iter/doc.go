@@ -28,7 +28,8 @@
 // *[panics.Recovered] once in-flight work has finished. [MapSeqErr] does the
 // same rather than return an error, because the panic belongs to no element.
 // The ForEach functions range the input in the caller's goroutine, so the
-// panic propagates unchanged.
+// panic propagates unchanged once in-flight work has finished. A panic in fn
+// during that wait is dropped, as are the errors [ForEachSeqErr] collects.
 //
 // The caller can leave the range of a lazy Map function by break, by a panic
 // in the range body or by [runtime.Goexit] (t.Fatal calls it). Each one stops

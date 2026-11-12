@@ -655,3 +655,62 @@ func TestBodyPanic_CancelsInflightFnContexts(t *testing.T) {
 		})
 	}
 }
+
+// forEachInputPanicCases calls each ForEachSeq function over an input that
+// panics after two elements, with room for both to be in flight.
+func forEachInputPanicCases(fn func(context.Context, int)) map[string]func() {
+	opt := conkiter.WithMaxGoroutines(2)
+	return map[string]func(){
+		"ForEachSeq": func() {
+			conkiter.ForEachSeq(panickingInput(2), func(v int) { fn(context.Background(), v) }, opt)
+		},
+		"ForEachSeqCtx": func() {
+			conkiter.ForEachSeqCtx(panickingInput(2), fn, opt)
+		},
+		"ForEachSeqErr": func() {
+			_ = conkiter.ForEachSeqErr(panickingInput(2), func(ctx context.Context, v int) error { fn(ctx, v); return nil }, opt)
+		},
+	}
+}
+
+func TestForEachSeqInputPanic_PropagatesAfterInflightWork(t *testing.T) {
+	var ended atomic.Int32
+	fn := func(context.Context, int) {
+		defer ended.Add(1)
+		time.Sleep(time.Second)
+	}
+
+	for name, call := range forEachInputPanicCases(fn) {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ended.Store(0)
+
+				v := recoverFrom(call)
+
+				assert.Equal(t, errInput, v, "the input's panic must reach the caller unchanged")
+				assert.Equal(t, int32(2), ended.Load(), "both fn calls must return before the panic reaches the caller")
+			})
+		})
+	}
+}
+
+func TestForEachSeqInputPanic_CancelsInflightFnContexts(t *testing.T) {
+	var sawCancel atomic.Int32
+	fn := func(ctx context.Context, _ int) {
+		if awaitCancel(ctx) {
+			sawCancel.Add(1)
+		}
+	}
+
+	cases := forEachInputPanicCases(fn)
+	for _, name := range []string{"ForEachSeqCtx", "ForEachSeqErr"} {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				sawCancel.Store(0)
+
+				assert.Equal(t, errInput, recoverFrom(cases[name]))
+				assert.Equal(t, int32(2), sawCancel.Load(), "both in-flight fn contexts must be cancelled")
+			})
+		})
+	}
+}

@@ -39,11 +39,14 @@ type variant struct {
 	results resultOrder
 	errs    bool // an Err variant: failures and panics are returned as errors
 	inMap   bool // iterates a map, so dispatch order is not input order
-	// seqInput is set for variants that range a sequence the caller supplies
-	// on a goroutine of their own, so the plan can make that sequence panic.
+	// seqInput is set for variants that range a sequence the caller supplies,
+	// so the plan can make that sequence panic.
 	seqInput bool
-	run      func([]int, elemFn, []conkiter.Option) ([]int, error)
-	seq      func([]int, elemFn, []conkiter.Option) stditer.Seq[int] // set for lazy variants
+	// rawInputPanic is set for variants that range the input in the caller's
+	// goroutine, so its panic reaches the caller unwrapped.
+	rawInputPanic bool
+	run           func([]int, elemFn, []conkiter.Option) ([]int, error)
+	seq           func([]int, elemFn, []conkiter.Option) stditer.Seq[int] // set for lazy variants
 }
 
 func plain(fn elemFn) func(int) int {
@@ -167,16 +170,16 @@ var variants = []variant{
 	{name: "ForEachErr", errs: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
 		return nil, conkiter.ForEachErr(in, errOnly(fn), o...)
 	}},
-	{name: "ForEachSeq", run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
-		conkiter.ForEachSeq(slices.Values(in), func(v int) { plain(fn)(v) }, o...)
+	{name: "ForEachSeq", seqInput: true, rawInputPanic: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
+		conkiter.ForEachSeq(values(in), func(v int) { plain(fn)(v) }, o...)
 		return nil, nil
 	}},
-	{name: "ForEachSeqCtx", run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
-		conkiter.ForEachSeqCtx(slices.Values(in), func(ctx context.Context, v int) { withCtx(fn)(ctx, v) }, o...)
+	{name: "ForEachSeqCtx", seqInput: true, rawInputPanic: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
+		conkiter.ForEachSeqCtx(values(in), func(ctx context.Context, v int) { withCtx(fn)(ctx, v) }, o...)
 		return nil, nil
 	}},
-	{name: "ForEachSeqErr", errs: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
-		return nil, conkiter.ForEachSeqErr(slices.Values(in), errOnly(fn), o...)
+	{name: "ForEachSeqErr", errs: true, seqInput: true, rawInputPanic: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
+		return nil, conkiter.ForEachSeqErr(values(in), errOnly(fn), o...)
 	}},
 	{name: "ForEachMap", inMap: true, run: func(in []int, fn elemFn, o []conkiter.Option) ([]int, error) {
 		conkiter.ForEachMap(asMap(in), func(k, v int) { plain(fn)(sameKey(k, v)) }, o...)
@@ -367,8 +370,11 @@ func checkIterRun(t *rapid.T, plan iterPlan, o iterObs) {
 
 	// The call may re-panic with the input's panic only once the input has
 	// yielded every element before it, and each of those has been dispatched.
-	r, _ := o.recovered.(*panics.Recovered)
-	inputRepanicked := r != nil && r.Value == inputPanicValue
+	inputRepanicked := o.recovered == inputPanicValue
+	if !plan.variant.rawInputPanic {
+		r, _ := o.recovered.(*panics.Recovered)
+		inputRepanicked = r != nil && r.Value == inputPanicValue
+	}
 	if inputRepanicked {
 		if plan.inputPanicAt < 0 {
 			t.Fatalf("re-panicked with the input's panic, but the input does not panic")
