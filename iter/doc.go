@@ -9,8 +9,7 @@
 // Functions whose names end in Ctx pass a context into fn, derived from
 // [WithContext], so in-flight work can observe cancellation. It is cancelled
 // when the governing context is cancelled, when any fn call panics, and, for
-// the lazy [MapSeqCtx] and [MapSeq2Ctx], when the caller breaks out of the
-// range.
+// the lazy [MapSeqCtx] and [MapSeq2Ctx], when the caller leaves the range.
 //
 // Functions whose names end in Err also pass a context into fn, and collect
 // errors via [errors.Join], each wrapped in an [ElemError] carrying the
@@ -30,4 +29,10 @@
 // same rather than return an error, because the panic belongs to no element.
 // The ForEach functions range the input in the caller's goroutine, so the
 // panic propagates unchanged.
+//
+// The caller can leave the range of a lazy Map function by break, by a panic
+// in the range body or by [runtime.Goexit] (t.Fatal calls it). Each one stops
+// dispatch and waits for in-flight calls before the range exits. A panic in
+// the body carries on unchanged, and a panic in fn during that wait is
+// dropped.
 package iter

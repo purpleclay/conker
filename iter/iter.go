@@ -124,6 +124,10 @@ func (e *ElemError) Unwrap() error { return e.Err }
 // in the caller's goroutine as a *[panics.Recovered] once in-flight calls
 // have returned.
 //
+// A panic or [runtime.Goexit] in the range body (t.Fatal calls Goexit) stops
+// dispatch as a break does, and carries on once in-flight calls have
+// returned. A panic in fn during that wait is dropped.
+//
 // Example:
 //
 //	doubled := iter.MapSeq(slices.Values(nums), func(n int) int { return n * 2 })
@@ -138,10 +142,10 @@ func MapSeq[T, R any](in stditer.Seq[T], fn func(T) R, options ...Option) stdite
 // work can observe cancellation rather than only stopping dispatch.
 //
 // The context is derived from the one provided via [WithContext] and is
-// cancelled when that context is cancelled, when the caller breaks out of the
-// range, or when fn or the input sequence panics. Breaking out of the range still waits
-// for in-flight calls to return, so fn should observe ctx.Done() to return
-// promptly.
+// cancelled when that context is cancelled, when the caller leaves the range
+// (by break, a panic or [runtime.Goexit]), or when fn or the input sequence
+// panics. Leaving the range still waits for in-flight calls to return, so fn
+// should observe ctx.Done() to return promptly.
 //
 // Example:
 //
@@ -269,30 +273,32 @@ func mapSeq[T, R any](in stditer.Seq[T], fn func(T) R, fnCtx func(context.Contex
 			}
 		}()
 
-		// panicked tracks whether fn has panicked so done is closed at most
-		// once, and so remaining slots are drained (every in-flight goroutine
-		// joined) without yielding, before re-panicking in this goroutine.
-		var panicked bool
-		for s := range ordered {
-			<-s.done
-			if !panicked && pc.Recovered() != nil {
-				panicked = true
-				close(done)
-			}
-			if panicked {
-				continue
-			}
-			if !yield(s.val) {
-				close(done)
-				r.cancel() // reach in-flight fn calls before draining them
-				// Drain in-flight work so late panics are observed in this goroutine.
-				for s := range ordered {
-					<-s.done
-				}
-				pc.Repanic()
+		// stop ends dispatch, cancels in-flight fn calls and waits for them, so
+		// no goroutine outlives the range loop and a late fn panic is observed
+		// before the re-panic below.
+		var stopped bool
+		stop := func() {
+			if stopped {
 				return
 			}
+			stopped = true
+			close(done)
+			r.cancel()
+			for s := range ordered {
+				<-s.done
+			}
 		}
+		// A panic or runtime.Goexit in the range body skips the stop below.
+		// An fn panic caught while it unwinds is dropped: the body's wins.
+		defer stop()
+
+		for s := range ordered {
+			<-s.done
+			if pc.Recovered() != nil || !yield(s.val) {
+				break
+			}
+		}
+		stop()
 		pc.Repanic()
 	}
 }
@@ -313,6 +319,10 @@ func mapSeq[T, R any](in stditer.Seq[T], fn func(T) R, fnCtx func(context.Contex
 // A panic in fn, or in the input sequence, stops dispatch and is re-panicked
 // in the caller's goroutine as a *[panics.Recovered] once in-flight calls
 // have returned.
+//
+// A panic or [runtime.Goexit] in the range body (t.Fatal calls Goexit) stops
+// dispatch as a break does, and carries on once in-flight calls have
+// returned. A panic in fn during that wait is dropped.
 //
 // Example:
 //
@@ -336,8 +346,8 @@ func MapSeq2[K, V, R any](in stditer.Seq2[K, V], fn func(K, V) R, options ...Opt
 
 // MapSeq2Ctx is [MapSeq2] with a context passed into each fn call. The
 // context is cancelled on the same conditions as [MapSeqCtx]: when the
-// [WithContext] context is cancelled, the caller breaks out of the range, or
-// fn or the input sequence panics.
+// [WithContext] context is cancelled, the caller leaves the range, or fn or
+// the input sequence panics.
 func MapSeq2Ctx[K, V, R any](in stditer.Seq2[K, V], fn func(context.Context, K, V) R, options ...Option) stditer.Seq[R] {
 	return MapSeqCtx(
 		func(yield func(kvPair[K, V]) bool) {
